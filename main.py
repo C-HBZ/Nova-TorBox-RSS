@@ -1,136 +1,408 @@
-import time
+import os
 import re
+import time
 import logging
-import sys
-from typing import List, Dict
+import json
+from urllib.parse import quote
+from typing import List, Dict, Set, Tuple, Optional
 from curl_cffi import requests
 
-# ---------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------
-TEST_MODE = True  # Set to False for production runs
-# ---------------------------------------------------------
+# ==========================================
+# CONFIGURATION & TOGGLES
+# ==========================================
+TEST_RUN = True  # Set to False to perform live magnet additions to TorBox
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+TMDB_API_KEY = os.getenv("API_TMDB") or os.getenv("TMDB_API_KEY", "")
+TORBOX_API_KEY = os.getenv("API_TORBOX") or os.getenv("TORBOX_API_KEY", "")
 
-BLACKLIST_REGEX = re.compile(
-    r"(?i)\b(cam|ts|hdcam|hdtc|hq\s?pre|pre|screener|tc|telesync|dvdscr|telecine|hc|kor)\b"
+TORBOX_BASE_URL = "https://api.torbox.app/v1/api/torrents"
+TMDB_BASE_URL = "https://api.themoviedb.org/3"
+TORRENTIO_BASE_URL = "https://torrentio.strem.fun/stream"
+
+MAX_MOVIES = 30
+MAX_TV_SERIES = 20
+
+# Regex pattern to catch bootleg releases, telesyncs, and forced foreign dubs
+INVALID_RELEASE_PATTERN = re.compile(
+    r"\b(CAM|HDCAM|CAMRIP|TS|TELESYNC|HDTS|TC|TELECINE|HC|KORSUB|WORKPRINT|WP|DUBBED|DUAL-AUDIO)\b",
+    re.IGNORECASE
 )
 
-# Initialise a persistent session that mimics a real browser to avoid 403s
-http_session = requests.Session(impersonate="chrome")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
-def deduplicate_queue(media_list: List[Dict]) -> List[Dict]:
-    seen = set()
-    unique = []
-    for item in media_list:
-        if item['imdb_id'] not in seen:
-            unique.append(item)
-            seen.add(item['imdb_id'])
-    return unique
 
-def fetch_torrentio(imdb_id: str, media_type: str = "movie", season: int = None, episode: int = None) -> List[Dict]:
-    base_url = "https://torrentio.strem.fun/stream"
-    
-    if media_type == "movie":
-        url = f"{base_url}/movie/{imdb_id}.json"
+# ==========================================
+# QUALITY & PARSING LOGIC
+# ==========================================
+def is_valid_release(release_title: str) -> bool:
+    """Filters out low-grade bootleg releases, bad encodes, and unwanted audio dubs."""
+    if not release_title:
+        return False
+    return not bool(INVALID_RELEASE_PATTERN.search(release_title))
+
+
+def calculate_quality_score(title: str) -> float:
+    """
+    Calculates priority score:
+    2160p/4K = 3.0 points (+0.5 for HDR/DV)
+    1080p = 2.0 points
+    Lower = 0 points (rejected)
+    """
+    t_upper = title.upper()
+    score = 0.0
+
+    if any(q in t_upper for q in ["2160P", "4K", "UHD"]):
+        score = 3.0
+        if any(hdr in t_upper for hdr in ["HDR", "DV", "DOVI", "HDR10+"]):
+            score += 0.5
+    elif "1080P" in t_upper:
+        score = 2.0
+
+    return score
+
+
+def extract_episode_info(title: str) -> Optional[Tuple[str, str]]:
+    """Returns (series_key, episode_identifier) e.g. ('slow_horses', 's03e01')."""
+    match = re.search(r"^(.*?)[._\s-]+[sS](\d{1,2})(?:[eE](\d{1,2}))?", title)
+    if not match:
+        return None
+    raw_name, season, episode = match.groups()
+    clean_series = re.sub(r"[^\w\s]", "", raw_name).strip().lower()
+    clean_series = re.sub(r"[\s_.]+", "_", clean_series)
+
+    if episode:
+        ep_id = f"s{int(season):02d}e{int(episode):02d}"
     else:
-        url = f"{base_url}/series/{imdb_id}:{season}:{episode}.json"
+        ep_id = f"s{int(season):02d}_pack"
 
-    max_retries = 4
+    return clean_series, ep_id
+
+
+def extract_movie_key(title: str) -> Optional[str]:
+    """Returns a unique key for deduplication e.g. 'the_day_of_the_jackal_2024'."""
+    match = re.search(r"^(.*?)(?:\(|\[|\b)(\d{4})(?:\)|\]|\b)", title)
+    if match:
+        raw_name, year = match.groups()
+    else:
+        raw_name = title
+        year = ""
+    clean_name = re.sub(r"[^\w\s]", "", raw_name).strip().lower()
+    clean_name = re.sub(r"[\s_.]+", "_", clean_name)
+    if not clean_name:
+        return None
+    return f"{clean_name}_{year}" if year else clean_name
+
+
+# ==========================================
+# NETWORK & API HANDLING
+# ==========================================
+def safe_http_get(session: requests.Session, url: str, params: dict = None, max_retries: int = 3) -> Optional[requests.Response]:
+    """Executes HTTP GET with exponential backoff to handle rate limits (429/403)."""
     for attempt in range(max_retries):
         try:
-            response = http_session.get(url, timeout=10)
-            if response.status_code == 429:
-                wait_time = (2 ** attempt) + 1
-                logging.warning(f"Rate limited (429) on {imdb_id}. Backing off for {wait_time}s...")
-                time.sleep(wait_time)
+            res = session.get(url, params=params, timeout=10)
+            if res.status_code == 429:
+                wait = (2 ** attempt) + 1
+                logger.warning(f"Rate limited (429). Retrying in {wait}s...")
+                time.sleep(wait)
                 continue
-            
-            # Catch 403s specifically so they don't crash the script silently
-            if response.status_code == 403:
-                logging.error(f"HTTP 403 Forbidden on {imdb_id} - Bot protection blocking request.")
-                return []
-                
-            response.raise_for_status()
-            time.sleep(1.2) 
-            return response.json().get("streams", [])
-            
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Network error on {imdb_id}: {e}")
-            time.sleep(2)
-            
-    return []
+            if res.status_code == 403:
+                logger.error(f"HTTP 403 Forbidden accessing {url}. Cloudflare protection active.")
+                return None
+            res.raise_for_status()
+            return res
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Request failed for {url}: {e}")
+            time.sleep(1)
+    return None
 
-def rank_and_filter_streams(streams: List[Dict]) -> List[Dict]:
-    valid_streams = []
-    for stream in streams:
-        title = stream.get("title", "")
-        title_lower = title.lower()
-        
-        if BLACKLIST_REGEX.search(title):
+
+# ==========================================
+# TORBOX MANAGEMENT & CACHE
+# ==========================================
+def get_existing_torbox_items(session: requests.Session) -> Tuple[Set[str], Set[str]]:
+    """Fetches current TorBox library to prevent re-adding existing items."""
+    res = safe_http_get(session, f"{TORBOX_BASE_URL}/mylist", params={"bypass_cache": "true"})
+    if not res:
+        return set(), set()
+
+    try:
+        data = res.json().get("data", [])
+        if isinstance(data, dict):
+            data = data.get("items", data.get("torrents", []))
+
+        existing_episodes = set()
+        existing_movies = set()
+
+        for item in data:
+            name = item.get("name") or item.get("torrent_name") or ""
+            ep_info = extract_episode_info(name)
+            if ep_info:
+                existing_episodes.add(f"{ep_info[0]}_{ep_info[1]}")
+            else:
+                mov_key = extract_movie_key(name)
+                if mov_key:
+                    existing_movies.add(mov_key)
+
+        return existing_episodes, existing_movies
+    except Exception as e:
+        logger.error(f"Failed to parse existing TorBox items: {e}")
+        return set(), set()
+
+
+def check_torbox_cache(session: requests.Session, hashes: List[str]) -> Dict[str, bool]:
+    """Batch checks hashes against TorBox servers."""
+    if not hashes:
+        return {}
+
+    cached_hashes = {}
+    for i in range(0, len(hashes), 100):
+        batch = hashes[i:i+100]
+        params = {"hash": ",".join(batch), "format": "object", "list_files": "false"}
+        res = safe_http_get(session, f"{TORBOX_BASE_URL}/checkcached", params=params)
+        if res and res.status_code == 200:
+            try:
+                data = res.json().get("data", {})
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        cached_hashes[k.lower()] = bool(v)
+            except Exception as e:
+                logger.error(f"Failed to parse TorBox cache response: {e}")
+    return cached_hashes
+
+
+# ==========================================
+# TMDB & TRACKER DISCOVERY
+# ==========================================
+def get_tmdb_trending(session: requests.Session, media_type: str, target_count: int = 50) -> List[dict]:
+    """Fetches trending movies or TV series from TMDB."""
+    results = []
+    page = 1
+    while len(results) < target_count and page <= 5:
+        url = f"{TMDB_BASE_URL}/trending/{media_type}/week"
+        res = safe_http_get(session, url, params={"api_key": TMDB_API_KEY, "page": page})
+        if not res:
+            break
+        data = res.json()
+        page_results = data.get("results", [])
+        if not page_results:
+            break
+        results.extend(page_results)
+        page += 1
+    return results[:target_count]
+
+
+def get_imdb_id(session: requests.Session, tmdb_id: int, media_type: str) -> Optional[str]:
+    """Translates TMDB ID to IMDb ID for Torrentio querying."""
+    url = f"{TMDB_BASE_URL}/{media_type}/{tmdb_id}/external_ids"
+    res = safe_http_get(session, url, params={"api_key": TMDB_API_KEY})
+    if res and res.status_code == 200:
+        imdb_id = res.json().get("imdb_id")
+        if imdb_id and imdb_id.startswith("tt"):
+            return imdb_id
+    return None
+
+
+# ==========================================
+# MAIN AUTOMATION ROUTINE
+# ==========================================
+def main():
+    if not TMDB_API_KEY or not TORBOX_API_KEY:
+        raise ValueError("Missing API_TMDB or API_TORBOX environment variables.")
+
+    # Session configured with browser impersonation
+    session = requests.Session(impersonate="chrome")
+    session.headers.update({"Authorization": f"Bearer {TORBOX_API_KEY}"})
+
+    logger.info(f"--- RUNNING TORBOX AUTOMATION PIPELINE (TEST_RUN = {TEST_RUN}) ---")
+
+    # Step 1: Map existing TorBox library to avoid duplicates
+    existing_episodes, existing_movies = get_existing_torbox_items(session)
+    logger.info(f"Existing TorBox items indexed: {len(existing_movies)} movies, {len(existing_episodes)} episodes.")
+
+    # Step 2: Fetch trending targets from TMDB
+    trending_movies = get_tmdb_trending(session, "movie", target_count=40)
+    trending_shows = get_tmdb_trending(session, "tv", target_count=20)
+    logger.info(f"TMDB returned {len(trending_movies)} movie targets and {len(trending_shows)} TV series targets.")
+
+    movie_candidates = []
+    movie_diagnostics = []
+
+    # Step 3: Gather Movie Candidates from Torrentio
+    logger.info("Querying Torrentio for film releases...")
+    for movie in trending_movies:
+        title = movie.get("title", "")
+        release_date = movie.get("release_date", "")
+        year = release_date[:4] if release_date else ""
+        tmdb_id = movie.get("id")
+        mov_key = extract_movie_key(f"{title} {year}")
+
+        if not title or not mov_key:
             continue
-            
-        if "2160p" in title_lower or "4k" in title_lower:
-            score = 3
-        elif "1080p" in title_lower:
-            score = 2
+
+        diag = {"title": title, "year": year, "key": mov_key, "status": "PENDING", "streams_found": 0, "reason": ""}
+
+        if mov_key in existing_movies:
+            diag["status"] = "SKIPPED"
+            diag["reason"] = "Already exists in TorBox library"
+            movie_diagnostics.append(diag)
+            continue
+
+        imdb_id = get_imdb_id(session, tmdb_id, "movie")
+        if not imdb_id:
+            diag["status"] = "REJECTED"
+            diag["reason"] = "No IMDb ID mapped on TMDB"
+            movie_diagnostics.append(diag)
+            continue
+
+        res = safe_http_get(session, f"{TORRENTIO_BASE_URL}/movie/{imdb_id}.json")
+        time.sleep(1.0)  # Throttling rate to prevent Torrentio block
+
+        if res and res.status_code == 200:
+            streams = res.json().get("streams", [])
+            diag["streams_found"] = len(streams)
+            valid_found = []
+
+            for stream in streams:
+                t_hash = stream.get("infoHash", "").lower()
+                details = stream.get("title", "")
+
+                if not is_valid_release(details):
+                    continue
+
+                score = calculate_quality_score(details)
+                if t_hash and score > 0:
+                    candidate = {
+                        "key": mov_key,
+                        "hash": t_hash,
+                        "magnet": f"magnet:?xt=urn:btih:{t_hash}&dn={quote(title)}",
+                        "score": score,
+                        "title": f"{title} ({year}) [{details.splitlines()[0]}]"
+                    }
+                    movie_candidates.append(candidate)
+                    valid_found.append(candidate)
+
+            if not valid_found:
+                diag["status"] = "REJECTED"
+                diag["reason"] = "No valid 1080p/2160p releases found"
+            else:
+                diag["candidates"] = valid_found
+            movie_diagnostics.append(diag)
+
+    # Step 4: Gather TV Series Candidates from Torrentio
+    logger.info("Querying Torrentio for TV series releases...")
+    tv_candidates = []
+    for show in trending_shows:
+        show_title = show.get("name", "")
+        tmdb_id = show.get("id")
+        imdb_id = get_imdb_id(session, tmdb_id, "tv")
+
+        if not imdb_id:
+            continue
+
+        # Fetch S01E01 as baseline test for series availability
+        res = safe_http_get(session, f"{TORRENTIO_BASE_URL}/series/{imdb_id}:1:1.json")
+        time.sleep(1.0)
+
+        if res and res.status_code == 200:
+            for stream in res.json().get("streams", []):
+                t_hash = stream.get("infoHash", "").lower()
+                details = stream.get("title", "")
+
+                if not is_valid_release(details):
+                    continue
+
+                score = calculate_quality_score(details)
+                ep_info = extract_episode_info(details)
+
+                if ep_info and score > 0 and t_hash:
+                    series_key, ep_id = ep_info
+                    full_ep_key = f"{series_key}_{ep_id}"
+
+                    if full_ep_key not in existing_episodes:
+                        tv_candidates.append({
+                            "series_key": series_key,
+                            "ep_id": ep_id,
+                            "full_key": full_ep_key,
+                            "hash": t_hash,
+                            "magnet": f"magnet:?xt=urn:btih:{t_hash}&dn={quote(show_title)}",
+                            "score": score,
+                            "title": details.splitlines()[0]
+                        })
+
+    # Step 5: Batch Check Hash Caching on TorBox
+    all_hashes = list({c["hash"] for c in movie_candidates + tv_candidates})
+    logger.info(f"Pinging TorBox cache endpoint for {len(all_hashes)} candidate hashes...")
+    cached_map = check_torbox_cache(session, all_hashes)
+
+    # Step 6: Select Highest Scoring Cached Releases
+    selected_movies = {}
+    for diag in movie_diagnostics:
+        if diag.get("status") in ["SKIPPED", "REJECTED"]:
+            continue
+
+        candidates = diag.get("candidates", [])
+        cached_options = [c for c in candidates if cached_map.get(c["hash"])]
+
+        if not cached_options:
+            diag["status"] = "REJECTED"
+            diag["reason"] = f"0 of {diag['streams_found']} streams cached on TorBox"
         else:
-            continue 
-            
-        if score == 3 and ("hdr" in title_lower or "dv" in title_lower or "dovi" in title_lower):
-            score += 0.5
+            best = max(cached_options, key=lambda x: x["score"])
+            diag["status"] = "SELECTED"
+            diag["selected_release"] = best
+            selected_movies[diag["key"]] = best
 
-        valid_streams.append({"stream": stream, "score": score})
-        
-    valid_streams.sort(key=lambda x: x["score"], reverse=True)
-    return [s["stream"] for s in valid_streams]
+    final_movies = list(selected_movies.values())[:MAX_MOVIES]
 
-def execute_pipeline(media_queue: List[Dict], is_test: bool) -> Dict:
-    clean_queue = deduplicate_queue(media_queue)
-    logging.info(f"Initiating run for {len(clean_queue)} targets. (TEST MODE: {is_test})")
+    selected_tv = {}
+    for c in tv_candidates:
+        if not cached_map.get(c["hash"]):
+            continue
+        full_key = c["full_key"]
+        if full_key not in selected_tv or c["score"] > selected_tv[full_key]["score"]:
+            selected_tv[full_key] = c
 
-    results = {}
-    for item in clean_queue:
-        imdb_id = item['imdb_id']
-        m_type = item.get('type', 'movie')
-        
-        if m_type == "movie":
-            streams = fetch_torrentio(imdb_id, "movie")
+    final_tv_payloads = list(selected_tv.values())[:MAX_TV_SERIES]
+
+    # Step 7: Output Auditing Summary & Execution
+    logger.info("==========================================")
+    logger.info("MOVIE AUDIT BREAKDOWN:")
+    for diag in movie_diagnostics:
+        status = diag["status"]
+        title = f"{diag['title']} ({diag['year']})"
+        if status == "SELECTED":
+            rel = diag["selected_release"]
+            logger.info(f"  [SELECTED] {title} -> {rel['title']}")
+        elif status == "SKIPPED":
+            logger.info(f"  [SKIPPED]  {title} -> {diag['reason']}")
         else:
-            streams = fetch_torrentio(imdb_id, "series", item.get("season", 1), item.get("episode", 1))
+            logger.info(f"  [REJECTED] {title} -> {diag['reason']}")
 
-        best_streams = rank_and_filter_streams(streams)
-        
-        if best_streams:
-            best_match = best_streams[0]
-            results[imdb_id] = best_match
-            release_name = best_match.get('title', 'Unknown').split('\n')[0]
-            logging.info(f"Acquired: [{imdb_id}] -> {release_name}")
-        else:
-            logging.info(f"Rejected: [{imdb_id}] -> No valid 1080p/2160p scene releases found.")
-            results[imdb_id] = None
+    logger.info("==========================================")
+    logger.info(f"SELECTION SUMMARY: {len(final_movies)} Movies, {len(final_tv_payloads)} TV Episodes queued.")
+    logger.info("==========================================")
 
-    return results
-
-def get_production_queue() -> List[Dict]:
-    """Placeholder for your live data ingestion logic."""
-    logging.info("Fetching production queue...")
-    return []
+    if TEST_RUN:
+        logger.info("[TEST RUN ACTIVE] Items identified but NOT pushed to TorBox:\n")
+        for m in final_movies:
+            logger.info(f"  - FILM: {m['title']} (Hash: {m['hash']})")
+        for t in final_tv_payloads:
+            logger.info(f"  - TV:   {t['title']} (Hash: {t['hash']})")
+    else:
+        logger.info("[LIVE RUN ACTIVE] Pushing cached magnets to TorBox...")
+        for item in final_movies + final_tv_payloads:
+            try:
+                res = session.post(f"{TORBOX_BASE_URL}/createtorrent", data={"magnet": item["magnet"]})
+                if res and res.status_code == 200:
+                    logger.info(f"[SUCCESS] Added: {item['title']}")
+                else:
+                    logger.error(f"Failed adding {item['title']}")
+                time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Error adding {item['title']}: {e}")
 
 if __name__ == "__main__":
-    if TEST_MODE:
-        logging.info("Running in TEST MODE using static payload.")
-        payload = [
-            {"imdb_id": "tt15239678", "type": "movie"}, # Dune: Part Two
-            {"imdb_id": "tt15239678", "type": "movie"}, # Duplicate injection
-            {"imdb_id": "tt0903747", "type": "series", "season": 5, "episode": 14} # Breaking Bad
-        ]
-    else:
-        logging.info("Running in PRODUCTION MODE.")
-        payload = get_production_queue()
-        if not payload:
-            logging.error("Production queue is empty. Exiting.")
-            sys.exit(1)
-            
-    final_output = execute_pipeline(payload, TEST_MODE)
+    main()
