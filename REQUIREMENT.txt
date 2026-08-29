@@ -1,0 +1,46 @@
+REQUIREMENT
+
+Goal
+Use TorBox as the content source for Nova Player on Android TV, keeping the library refreshed multiple times per day with recent English-targeted movies and TV shows relevant to UK, USA, Australia and Canada audiences. Foreign-made titles are acceptable when they are presented in an English-language-friendly format, but the shortlist should bias toward titles aimed at English-speaking audiences.
+
+Source of truth
+Use the live Stremio/Torrentio stream JSON payloads as the real source of media availability and metadata. Do not treat the Comet addon manifest as a content source. The Comet JSON is only a Stremio addon descriptor and does not contain actual torrent stream data.
+
+Content scope
+- Prefer recent, currently available content released within the last 24 months.
+- Prioritise new movie releases and newly launched TV series.
+- Keep the library focused on titles that match the English-language market, while not excluding valid foreign content when it is compatible with that audience.
+- Exclude pornography and other clearly non-family-safe content.
+
+Quality rules
+- Prefer 2160p releases.
+- If a valid 2160p release is unavailable, allow 1080p as fallback.
+- Reject anything below 1080p.
+- Avoid CAM, screener, workprint, pre-release, low-quality or obviously junk releases.
+- Prefer strong audio tracks such as DTS-HD / TrueHD / Atmos / Dolby Digital / DTS.
+- Do not prefer foreign dub-only packs unless the release is clearly compatible with the English-language target and still has an English audio/title path.
+
+Movie targets
+- Keep a rolling set of the newest 25 movies that pass the required filters.
+- The script should discover more than 25 candidates, then select the most recent valid films that meet the criteria.
+- Update the list on each run.
+
+TV targets
+- Keep a rolling set of the newest 20 TV series/episode groups that pass the required filters.
+- Prefer the most recently launched or active series.
+- Add new episodes whenever they appear for an already tracked series.
+- Avoid stale older archive content.
+
+Library management
+- The script must check TorBox before queueing, and avoid re-adding items already cached or already in the library.
+- It should manage the TorBox library so that the newest valid 20 TV entries and 25 movie entries remain, deleting or replacing older items as needed.
+- Deduplication must be based on real stream metadata such as IMDb/series identity, hash, and release identity rather than crude filename-only heuristics.
+
+Implementation notes
+- Mirror the working Stremio/Torrentio stream logic instead of building custom regex-only filtering that rejects valid live data.
+- Filter using the actual release title, quality markers, audio hints and metadata patterns exposed by the live stream JSON.
+- Keep the flow simple: TMDB discovery -> metadata lookup -> live stream query -> quality filtering -> TorBox cache validation -> queue selection.
+- Multiple refresh runs per day are expected, and the script should be capable of updating as new titles become available.
+
+Operational note
+- WebDAV usage is the user-facing storage layer for Nova Player, but the scraper logic itself should operate from actual torrent/debrid stream metadata and then keep TorBox in sync with the latest valid content set.
