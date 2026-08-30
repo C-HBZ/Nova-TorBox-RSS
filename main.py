@@ -32,6 +32,7 @@ MANIFEST_URLS = [
 MAX_MOVIES = 30
 MAX_TV_SERIES = 20
 MAX_MEDIA_AGE_MONTHS = 24
+MAX_NEW_EPISODES_PER_SHOW = 15
 JUSTWATCH_NEW_URL = "https://www.justwatch.com/us/new"
 MIN_TMDB_POPULARITY = 5.0
 MIN_TMDB_VOTE_COUNT = 5
@@ -58,9 +59,17 @@ ENGLISH_HINT_PATTERNS = (
 
 RESOLUTION_PATTERNS = ("2160P", "1080P", "UHD", "4K")
 
+# Audio ranking tiers used only as a tie-breaker between candidates of the same resolution.
+PREMIUM_AUDIO_PATTERNS = ("TRUEHD", "DTS-HD", "DTSHD")
+STANDARD_AUDIO_PATTERNS = ("ATMOS", "DDP", "DD+", "EAC3", "AC3", "DTS")
+PREMIUM_AUDIO_BONUS = 6.0
+STANDARD_AUDIO_BONUS = 3.0
+
 BAD_RELEASE_RE = re.compile(r"\b(?:" + "|".join(re.escape(p) for p in BAD_RELEASE_PATTERNS) + r")\b", re.IGNORECASE)
 FOREIGN_ONLY_RE = re.compile(r"\b(?:" + "|".join(re.escape(p) for p in FOREIGN_ONLY_PATTERNS) + r")\b", re.IGNORECASE)
 ENGLISH_HINT_RE = re.compile(r"\b(?:" + "|".join(re.escape(p) for p in ENGLISH_HINT_PATTERNS) + r")\b", re.IGNORECASE)
+PREMIUM_AUDIO_RE = re.compile(r"\b(?:" + "|".join(re.escape(p) for p in PREMIUM_AUDIO_PATTERNS) + r")\b", re.IGNORECASE)
+STANDARD_AUDIO_RE = re.compile(r"\b(?:" + "|".join(re.escape(p) for p in STANDARD_AUDIO_PATTERNS) + r")\b", re.IGNORECASE)
 NON_LATIN_PATTERN = re.compile(r"[\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -89,6 +98,17 @@ def read_manifest_urls(path: str = MANIFEST_PATH) -> List[str]:
     return [expand_secret_tokens(url) for url in MANIFEST_URLS]
 
 
+def get_torrentio_stream_base_url(manifest_urls: List[str]) -> str:
+    """Use the personalised sort/qualityfilter/debridoptions/torbox config from manifest.txt's Torrentio manifest URL, instead of the default public endpoint."""
+    for url in manifest_urls:
+        if "torrentio.strem.fun/" not in url or not url.endswith("manifest.json"):
+            continue
+        config = url.split("torrentio.strem.fun/", 1)[1][: -len("manifest.json")].rstrip("/")
+        if config:
+            return f"https://torrentio.strem.fun/{config}/stream"
+    return TORRENTIO_BASE_URL
+
+
 def is_recent_enough(date_value: Optional[str], max_months: int = MAX_MEDIA_AGE_MONTHS) -> bool:
     if not date_value:
         return False
@@ -96,9 +116,11 @@ def is_recent_enough(date_value: Optional[str], max_months: int = MAX_MEDIA_AGE_
         date_text = date_value.split("T")[0]
         year, month, day = [int(part) for part in date_text.split("-")[:3]]
         then = datetime.date(year, month, day)
-        now = datetime.date.today()
-        months_delta = (now.year - then.year) * 12 + (now.month - then.month)
-        return 0 <= months_delta <= max_months
+        today = datetime.date.today()
+        if then > today:
+            return False
+        cutoff = today - datetime.timedelta(days=max_months * 30)
+        return then >= cutoff
     except Exception:
         return False
 
@@ -114,6 +136,9 @@ def normalize_title_for_match(value: str) -> str:
 def is_mainstream_tmdb_candidate(item: dict) -> bool:
     """Keep the discovery pool aimed at newer, mainstream English-market titles without redesigning the flow."""
     if not isinstance(item, dict):
+        return False
+
+    if item.get("adult"):
         return False
 
     popularity = float(item.get("popularity") or 0.0)
@@ -240,6 +265,45 @@ def extract_quality_bucket(title: str) -> Optional[str]:
     return None
 
 
+# Torrentio's debrid-integrated manifest (torbox=<key>) drops "infoHash" and instead exposes a
+# "/resolve/torbox/<key>/<hash>/..." url, and signals live cache status via the stream name prefix
+# ("[TB+]" = already cached on TorBox, "[TB download]" = not cached yet).
+RESOLVE_HASH_RE = re.compile(r"/resolve/torbox/[^/]+/([0-9a-fA-F]{32,40})(?:/|$)")
+CACHED_STREAM_RE = re.compile(r"^\[TB\+\]", re.IGNORECASE)
+
+
+def extract_stream_hash(stream: dict) -> str:
+    """Return the lowercase infoHash for a Torrentio stream, from either the classic field or a debrid resolve URL."""
+    info_hash = (stream.get("infoHash") or "").strip().lower()
+    if info_hash:
+        return info_hash
+    match = RESOLVE_HASH_RE.search(stream.get("url") or "")
+    return match.group(1).lower() if match else ""
+
+
+def is_stream_cached_hint(stream: dict) -> bool:
+    """True when the debrid-integrated manifest already tells us this stream is cached on TorBox."""
+    return bool(CACHED_STREAM_RE.match((stream.get("name") or "").strip()))
+
+
+STANDARD_EPISODE_RE = re.compile(r"(?i)\bs\d{1,2}e\d{1,2}\b")
+
+
+def get_canonical_episode_text(stream: dict) -> str:
+    """Extra correctness measure: TV release/torrent display names are often localized or ambiguous
+    season summaries (e.g. a bare "S01" or a translated "Season 1 / Episodes 1-2 of 8" line), but the
+    underlying per-file filename Torrentio/TorBox resolves to almost always follows the international
+    SxxEyy filename standard. Prefer that filename (or the first line that actually matches SxxEyy) for
+    identifying season/episode and series identity, instead of the noisier top-level release name."""
+    filename = (stream.get("behaviorHints") or {}).get("filename") or ""
+    if filename and STANDARD_EPISODE_RE.search(filename):
+        return filename
+    for line in (stream.get("title") or "").splitlines():
+        if STANDARD_EPISODE_RE.search(line):
+            return line
+    return filename or (stream.get("title") or "")
+
+
 def canonical_stream_key(title: str) -> str:
     clean = re.sub(r"\b(?:2160p|1080p|4k|uhd|hdr|hevc|h265|x265|x264|bluray|webdl|webrip|hdtv|remux|av1|aac|ac3|eac3|dts|eng|english|multi|dual|audio|sub|subs|xvid|avi|mkv|mp4)\b", " ", title, flags=re.IGNORECASE)
     clean = re.sub(r"[._\-\[\](){}+/\\]", " ", clean)
@@ -308,16 +372,24 @@ def is_valid_release(release_title: str) -> bool:
 
 
 def calculate_quality_score(title: str) -> float:
-    """Bias 2160p ahead of 1080p, and ignore all others."""
+    """Bias 2160p ahead of 1080p; audio codec only breaks ties within the same resolution."""
     quality = extract_quality_bucket(title)
+    if quality not in ALLOWED_QUALITY_PRIORITY:
+        return 0.0
+
+    upper = title.upper()
+    audio_bonus = 0.0
+    if PREMIUM_AUDIO_RE.search(upper):
+        audio_bonus = PREMIUM_AUDIO_BONUS
+    elif STANDARD_AUDIO_RE.search(upper):
+        audio_bonus = STANDARD_AUDIO_BONUS
+
     if quality == "2160P":
         score = 100.0
-        if any(hdr in title.upper() for hdr in ["HDR", "DV", "DOVI", "HDR10+"]):
+        if any(hdr in upper for hdr in ["HDR", "DV", "DOVI", "HDR10+"]):
             score += 10.0
-        return score
-    if quality == "1080P":
-        return 90.0
-    return 0.0
+        return score + audio_bonus
+    return 90.0 + audio_bonus
 
 
 def extract_episode_info(title: str) -> Optional[Tuple[str, str]]:
@@ -356,6 +428,11 @@ def extract_episode_info(title: str) -> Optional[Tuple[str, str]]:
     clean_series = re.sub(r"\s+", "_", clean_series).strip("_")
     ep_id = f"s{int(season):02d}e{int(episode):02d}" if episode else f"s{int(season):02d}_pack"
     return clean_series, ep_id
+
+
+def season_number_from_ep_id(ep_id: str) -> Optional[int]:
+    match = re.match(r"s(\d+)", ep_id or "")
+    return int(match.group(1)) if match else None
 
 
 def extract_movie_key(title: str) -> Optional[str]:
@@ -397,33 +474,122 @@ def safe_http_get(session: requests.Session, url: str, params: dict = None, max_
 # ==========================================
 # TORBOX MANAGEMENT & CACHE
 # ==========================================
-def get_existing_torbox_items(session: requests.Session) -> Tuple[Set[str], Set[str]]:
+def fetch_torbox_library(session: requests.Session) -> List[dict]:
     res = safe_http_get(session, f"{TORBOX_BASE_URL}/mylist", params={"bypass_cache": "true"})
     if not res:
-        return set(), set()
-
+        return []
     try:
         data = res.json().get("data", [])
         if isinstance(data, dict):
             data = data.get("items", data.get("torrents", []))
-
-        existing_episodes = set()
-        existing_movies = set()
-
-        for item in data:
-            name = item.get("name") or item.get("torrent_name") or ""
-            ep_info = extract_episode_info(name)
-            if ep_info:
-                existing_episodes.add(f"{ep_info[0]}_{ep_info[1]}")
-            else:
-                mov_key = extract_movie_key(name)
-                if mov_key:
-                    existing_movies.add(mov_key)
-
-        return existing_episodes, existing_movies
+        return data if isinstance(data, list) else []
     except Exception as exc:
-        logger.error(f"Failed to parse existing TorBox items: {exc}")
-        return set(), set()
+        logger.error(f"Failed to parse TorBox library: {exc}")
+        return []
+
+
+def get_existing_torbox_items(library: List[dict]) -> Tuple[Set[str], Set[str]]:
+    existing_episodes = set()
+    existing_movies = set()
+
+    for item in library:
+        name = item.get("name") or item.get("torrent_name") or ""
+        ep_info = extract_episode_info(name)
+        if ep_info:
+            existing_episodes.add(f"{ep_info[0]}_{ep_info[1]}")
+        else:
+            mov_key = extract_movie_key(name)
+            if mov_key:
+                existing_movies.add(mov_key)
+
+    return existing_episodes, existing_movies
+
+
+def delete_torbox_torrent(session: requests.Session, torrent_id) -> bool:
+    try:
+        res = session.post(f"{TORBOX_BASE_URL}/controltorrent", json={"torrent_id": torrent_id, "operation": "delete"})
+        return bool(res is not None and res.status_code == 200)
+    except Exception as exc:
+        logger.error(f"Failed to delete TorBox torrent {torrent_id}: {exc}")
+        return False
+
+
+def prune_torbox_library(session: requests.Session, library: List[dict], dry_run: bool,
+                          max_movies: int = MAX_MOVIES, max_tv_series: int = MAX_TV_SERIES) -> None:
+    """Keep only the newest max_movies movies and max_tv_series distinct TV series (latest season only per series); delete the rest."""
+    movie_items: Dict[str, List[dict]] = {}
+    movie_latest_date: Dict[str, str] = {}
+    series_items: Dict[str, List[Tuple[dict, Tuple[str, str]]]] = {}
+    series_latest_date: Dict[str, str] = {}
+
+    for item in library:
+        name = item.get("name") or item.get("torrent_name") or ""
+        if not name or item.get("id") is None:
+            continue
+        added = item.get("created_at") or item.get("updated_at") or ""
+
+        ep_info = extract_episode_info(name)
+        if ep_info:
+            series_key = ep_info[0]
+            series_items.setdefault(series_key, []).append((item, ep_info))
+            if added > series_latest_date.get(series_key, ""):
+                series_latest_date[series_key] = added
+            continue
+
+        mov_key = extract_movie_key(name)
+        if not mov_key:
+            continue
+        movie_items.setdefault(mov_key, []).append(item)
+        if added > movie_latest_date.get(mov_key, ""):
+            movie_latest_date[mov_key] = added
+
+    kept_movie_keys = {
+        key for key, _ in sorted(movie_latest_date.items(), key=lambda pair: pair[1], reverse=True)[:max_movies]
+    }
+    kept_series_keys = {
+        key for key, _ in sorted(series_latest_date.items(), key=lambda pair: pair[1], reverse=True)[:max_tv_series]
+    }
+
+    to_delete: List[dict] = []
+    for mov_key, items in movie_items.items():
+        if mov_key in kept_movie_keys:
+            # Still trim accidental duplicate torrents for the same movie, keeping only the newest.
+            items_sorted = sorted(items, key=lambda it: it.get("created_at") or it.get("updated_at") or "", reverse=True)
+            to_delete.extend(items_sorted[1:])
+        else:
+            to_delete.extend(items)
+
+    for series_key, entries in series_items.items():
+        if series_key not in kept_series_keys:
+            to_delete.extend(item for item, _ in entries)
+            continue
+
+        # Within a kept series, retain only its most recent season; drop episodes from older seasons.
+        seasons_present = {season_number_from_ep_id(ep_id) for _, (_, ep_id) in entries}
+        seasons_present.discard(None)
+        if not seasons_present:
+            continue
+        latest_season = max(seasons_present)
+        for item, (_, ep_id) in entries:
+            if season_number_from_ep_id(ep_id) != latest_season:
+                to_delete.append(item)
+
+    if not to_delete:
+        logger.info("TorBox pruning: no old torrents needed removal.")
+        return
+
+    for item in to_delete:
+        name = item.get("name") or item.get("torrent_name") or ""
+        if dry_run:
+            logger.info(f"[TEST RUN] Would prune old TorBox torrent: {name}")
+            continue
+        if delete_torbox_torrent(session, item.get("id")):
+            logger.info(f"[PRUNED] Removed old TorBox torrent: {name}")
+        else:
+            logger.error(f"Failed to prune TorBox torrent: {name}")
+
+    verb = "Would prune" if dry_run else "Pruned"
+    logger.info(f"TorBox pruning: {verb} {len(to_delete)} old torrent(s) to maintain the {max_movies}/{max_tv_series} rolling library.")
 
 
 def check_torbox_cache(session: requests.Session, hashes: List[str]) -> Dict[str, bool]:
@@ -515,6 +681,33 @@ def get_imdb_id(session: requests.Session, tmdb_id: int, media_type: str) -> Opt
     return None
 
 
+def get_latest_season_progress(session: requests.Session, tmdb_id: int) -> Tuple[int, int]:
+    """Return (season_number, episodes_aired_so_far) for the show's current/most recent season.
+
+    Mirrors how Stremio/Torrentio-style clients track episode progress: TMDB's last_episode_to_air
+    tells us both the active season and how many episodes of it have actually aired, so we know the
+    full range of episodes worth searching for instead of only ever asking for episode 1.
+    """
+    res = safe_http_get(session, f"{TMDB_BASE_URL}/tv/{tmdb_id}", params={"api_key": TMDB_API_KEY})
+    if res and res.status_code == 200:
+        data = res.json()
+        last_ep = data.get("last_episode_to_air") or {}
+        season_number = last_ep.get("season_number")
+        episode_number = last_ep.get("episode_number")
+        if isinstance(season_number, int) and season_number > 0 and isinstance(episode_number, int) and episode_number > 0:
+            return season_number, episode_number
+
+        next_ep = data.get("next_episode_to_air") or {}
+        season_number = next_ep.get("season_number")
+        if isinstance(season_number, int) and season_number > 0:
+            return season_number, 1
+
+        number_of_seasons = data.get("number_of_seasons")
+        if isinstance(number_of_seasons, int) and number_of_seasons > 0:
+            return number_of_seasons, 1
+    return 1, 1
+
+
 # ==========================================
 # MAIN AUTOMATION ROUTINE
 # ==========================================
@@ -529,7 +722,11 @@ def main():
     manifest_urls = read_manifest_urls()
     logger.info(f"Loaded {len(manifest_urls)} manifest URLs from {MANIFEST_PATH}.")
 
-    existing_episodes, existing_movies = get_existing_torbox_items(session)
+    torrentio_base_url = get_torrentio_stream_base_url(manifest_urls)
+    logger.info(f"Using Torrentio stream base URL: {torrentio_base_url}")
+
+    torbox_library = fetch_torbox_library(session)
+    existing_episodes, existing_movies = get_existing_torbox_items(torbox_library)
     logger.info(f"Existing TorBox items indexed: {len(existing_movies)} movies, {len(existing_episodes)} episodes.")
 
     recent_movies = get_tmdb_recent_media(session, "movie", target_count=60)
@@ -539,6 +736,7 @@ def main():
 
     movie_candidates = []
     movie_diagnostics = []
+    hash_cache_hints: Dict[str, bool] = {}
 
     logger.info("Querying Torrentio for recent films...")
     for movie in recent_movies:
@@ -568,7 +766,7 @@ def main():
             movie_diagnostics.append(diag)
             continue
 
-        res = safe_http_get(session, f"{TORRENTIO_BASE_URL}/movie/{imdb_id}.json")
+        res = safe_http_get(session, f"{torrentio_base_url}/movie/{imdb_id}.json")
         time.sleep(1.0)
 
         if res and res.status_code == 200:
@@ -579,9 +777,9 @@ def main():
             seen_keys = set()
 
             for stream in streams:
-                t_hash = stream.get("infoHash", "").lower()
+                t_hash = extract_stream_hash(stream)
                 details = stream.get("title", "")
-                if not details:
+                if not details or not t_hash:
                     continue
                 if not is_valid_release(details):
                     continue
@@ -595,6 +793,8 @@ def main():
                     continue
                 seen_hashes.add(t_hash)
                 seen_keys.add(dedupe_key)
+
+                hash_cache_hints[t_hash] = hash_cache_hints.get(t_hash, False) or is_stream_cached_hint(stream)
 
                 score = calculate_quality_score(details)
                 if score > 0:
@@ -618,67 +818,116 @@ def main():
 
     logger.info("Querying Torrentio for recent series...")
     tv_candidates = []
+    tv_diagnostics = []
     for show in recent_shows:
         show_title = show.get("name", "")
         first_air_date = show.get("first_air_date", "")
+
         if not show_title or not is_recent_enough(first_air_date):
             continue
         if not is_mainstream_tmdb_candidate(show):
             continue
 
+        diag = {"title": show_title, "year": first_air_date[:4] if first_air_date else "", "status": "PENDING", "streams_found": 0, "reason": ""}
+
         tmdb_id = show.get("id")
         imdb_id = get_imdb_id(session, tmdb_id, "tv")
         if not imdb_id:
+            diag["status"] = "REJECTED"
+            diag["reason"] = "No IMDb ID mapped on TMDB"
+            tv_diagnostics.append(diag)
             continue
 
-        res = safe_http_get(session, f"{TORRENTIO_BASE_URL}/series/{imdb_id}:1:1.json")
-        time.sleep(1.0)
-        if not (res and res.status_code == 200):
-            continue
+        latest_season, episodes_aired = get_latest_season_progress(session, tmdb_id)
+        episodes_to_check = min(episodes_aired, MAX_NEW_EPISODES_PER_SHOW)
 
+        valid_found = []
         seen_hashes = set()
         seen_keys = set()
-        for stream in res.json().get("streams", []):
-            details = stream.get("title", "")
-            if not details:
-                continue
-            if not is_valid_release(details):
-                continue
+        known_series_key = None
+        got_any_response = False
 
-            quality = extract_quality_bucket(details)
-            if quality not in ALLOWED_QUALITY_PRIORITY:
-                continue
+        for episode_number in range(1, episodes_to_check + 1):
+            if known_series_key:
+                guessed_ep_id = f"s{latest_season:02d}e{episode_number:02d}"
+                if f"{known_series_key}_{guessed_ep_id}" in existing_episodes:
+                    continue  # already have this episode; no need to re-query Torrentio for it
 
-            t_hash = stream.get("infoHash", "").lower()
-            ep_info = extract_episode_info(details)
-            if ep_info:
-                series_key, ep_id = ep_info
-                full_ep_key = f"{series_key}_{ep_id}"
-                dedupe_key = build_torrent_dedupe_key(details, episode_key=full_ep_key)
-            else:
+            res = safe_http_get(session, f"{torrentio_base_url}/series/{imdb_id}:{latest_season}:{episode_number}.json")
+            time.sleep(1.0)
+            if not (res and res.status_code == 200):
                 continue
+            got_any_response = True
 
-            if t_hash in seen_hashes or dedupe_key in seen_keys:
-                continue
-            seen_hashes.add(t_hash)
-            seen_keys.add(dedupe_key)
+            streams = res.json().get("streams", [])
+            diag["streams_found"] += len(streams)
+            for stream in streams:
+                details = stream.get("title", "")
+                if not details:
+                    continue
+                if not is_valid_release(details):
+                    continue
 
-            score = calculate_quality_score(details)
-            if score > 0 and full_ep_key not in existing_episodes:
-                tv_candidates.append({
-                    "series_key": series_key,
-                    "ep_id": ep_id,
-                    "full_key": full_ep_key,
-                    "hash": t_hash,
-                    "magnet": f"magnet:?xt=urn:btih:{t_hash}&dn={quote(show_title)}",
-                    "score": score,
-                    "sort_date": first_air_date or "1970-01-01",
-                    "title": details.splitlines()[0],
-                })
+                quality = extract_quality_bucket(details)
+                if quality not in ALLOWED_QUALITY_PRIORITY:
+                    continue
+
+                t_hash = extract_stream_hash(stream)
+                if not t_hash:
+                    continue
+                episode_text = get_canonical_episode_text(stream)
+                ep_info = extract_episode_info(episode_text)
+                if ep_info:
+                    series_key, ep_id = ep_info
+                    if season_number_from_ep_id(ep_id) != latest_season:
+                        continue
+                    known_series_key = known_series_key or series_key
+                    full_ep_key = f"{series_key}_{ep_id}"
+                    dedupe_key = build_torrent_dedupe_key(episode_text, episode_key=full_ep_key)
+                else:
+                    continue
+
+                if t_hash in seen_hashes or dedupe_key in seen_keys:
+                    continue
+                seen_hashes.add(t_hash)
+                seen_keys.add(dedupe_key)
+
+                hash_cache_hints[t_hash] = hash_cache_hints.get(t_hash, False) or is_stream_cached_hint(stream)
+
+                score = calculate_quality_score(details)
+                if score > 0 and full_ep_key not in existing_episodes:
+                    candidate = {
+                        "series_key": series_key,
+                        "ep_id": ep_id,
+                        "full_key": full_ep_key,
+                        "hash": t_hash,
+                        "magnet": f"magnet:?xt=urn:btih:{t_hash}&dn={quote(show_title)}",
+                        "score": score,
+                        "sort_date": first_air_date or "1970-01-01",
+                        "title": episode_text.strip() or details.splitlines()[0],
+                    }
+                    tv_candidates.append(candidate)
+                    valid_found.append(candidate)
+
+        if not got_any_response:
+            diag["status"] = "REJECTED"
+            diag["reason"] = "No stream response from Torrentio"
+            tv_diagnostics.append(diag)
+            continue
+
+        if not valid_found:
+            diag["status"] = "REJECTED"
+            diag["reason"] = "No new valid 2160p/1080p English episodes found"
+        else:
+            diag["candidates"] = valid_found
+        tv_diagnostics.append(diag)
 
     all_hashes = list({c["hash"] for c in movie_candidates + tv_candidates})
     logger.info(f"Pinging TorBox cache endpoint for {len(all_hashes)} candidate hashes...")
     cached_map = check_torbox_cache(session, all_hashes)
+    for h, hint in hash_cache_hints.items():
+        if hint:
+            cached_map[h] = True
 
     selected_movies = {}
     for diag in movie_diagnostics:
@@ -688,7 +937,7 @@ def main():
         cached_options = [c for c in candidates if cached_map.get(c["hash"])]
         if not cached_options:
             diag["status"] = "REJECTED"
-            diag["reason"] = f"0 of {diag['streams_found']} streams cached on TorBox"
+            diag["reason"] = f"0 of {len(candidates)} valid releases cached on TorBox"
         else:
             best = max(cached_options, key=lambda x: (x["score"], x["sort_date"]))
             diag["status"] = "SELECTED"
@@ -698,14 +947,33 @@ def main():
     final_movies = sorted(selected_movies.values(), key=lambda item: item["sort_date"], reverse=True)[:MAX_MOVIES]
 
     selected_tv = {}
-    for c in tv_candidates:
-        if not cached_map.get(c["hash"]):
+    selected_series_keys = set()
+    for diag in tv_diagnostics:
+        if diag.get("status") in ["SKIPPED", "REJECTED"]:
             continue
-        full_key = c["full_key"]
-        if full_key not in selected_tv or (c["score"], c["sort_date"]) > (selected_tv[full_key]["score"], selected_tv[full_key]["sort_date"]):
-            selected_tv[full_key] = c
+        candidates = diag.get("candidates", [])
+        cached_options = [c for c in candidates if cached_map.get(c["hash"])]
+        if not cached_options:
+            diag["status"] = "REJECTED"
+            diag["reason"] = f"0 of {len(candidates)} valid episodes cached on TorBox"
+            continue
 
-    final_tv_payloads = sorted(selected_tv.values(), key=lambda item: item["sort_date"], reverse=True)[:MAX_TV_SERIES]
+        series_key = cached_options[0]["series_key"]
+        if series_key not in selected_series_keys and len(selected_series_keys) >= MAX_TV_SERIES:
+            diag["status"] = "REJECTED"
+            diag["reason"] = f"Already tracking {MAX_TV_SERIES} newer TV series this run"
+            continue
+
+        selected_series_keys.add(series_key)
+        diag["status"] = "SELECTED"
+        diag["selected_count"] = 0
+        for c in cached_options:
+            full_key = c["full_key"]
+            if full_key not in selected_tv or (c["score"], c["sort_date"]) > (selected_tv[full_key]["score"], selected_tv[full_key]["sort_date"]):
+                selected_tv[full_key] = c
+            diag["selected_count"] += 1
+
+    final_tv_payloads = sorted(selected_tv.values(), key=lambda item: item["sort_date"], reverse=True)
 
     logger.info("==========================================")
     logger.info("MOVIE AUDIT BREAKDOWN:")
@@ -720,7 +988,18 @@ def main():
             logger.info(f"  [REJECTED] {title} -> {diag['reason']}")
 
     logger.info("==========================================")
-    logger.info(f"SELECTION SUMMARY: {len(final_movies)} Movies, {len(final_tv_payloads)} TV Episodes queued.")
+    logger.info("TV AUDIT BREAKDOWN:")
+    for diag in tv_diagnostics:
+        title = f"{diag['title']} ({diag['year']})"
+        if diag["status"] == "SELECTED":
+            logger.info(f"  [SELECTED] {title} -> {diag['selected_count']} episode(s) queued")
+        elif diag["status"] == "SKIPPED":
+            logger.info(f"  [SKIPPED]  {title} -> {diag['reason']}")
+        else:
+            logger.info(f"  [REJECTED] {title} -> {diag['reason']}")
+
+    logger.info("==========================================")
+    logger.info(f"SELECTION SUMMARY: {len(final_movies)} Movies, {len(selected_series_keys)} TV Series ({len(final_tv_payloads)} new episodes) queued.")
     logger.info("==========================================")
 
     if TEST_RUN:
@@ -741,6 +1020,10 @@ def main():
                 time.sleep(0.5)
             except Exception as exc:
                 logger.error(f"Error adding {item['title']}: {exc}")
+
+    logger.info("==========================================")
+    logger.info("Pruning TorBox library to maintain rolling window...")
+    prune_torbox_library(session, torbox_library, dry_run=TEST_RUN)
 
 
 if __name__ == "__main__":
