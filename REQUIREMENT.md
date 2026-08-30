@@ -66,6 +66,10 @@ Each refresh cycle must:
 - When a series advances to a new season, remove the previous season's episodes from TorBox so only the current season remains for that series.
 - When a series falls out of the newest 20 (superseded by more recently active shows), remove all of its episodes from TorBox.
 
+**Episode discovery — query per-episode like Stremio/Torrentio clients do**
+
+Torrentio's stream endpoint is scoped to one specific season+episode per request (`/series/{imdbId}:{season}:{episode}.json`), the same way a Stremio client only asks for the episode a viewer is currently browsing. To collect *all* aired episodes of a series' current season — not just episode 1 — the script must query the endpoint once per aired episode number (from TMDB's `last_episode_to_air`, which also tells us how many episodes of the current season have aired so far), skipping the request entirely when that episode is already present in TorBox. This is capped at a sane maximum per show per run to bound request volume.
+
 **Extra correctness measure — standard SxxEyy filename matching**
 
 Torrent/release *display* names are frequently ambiguous or localized (e.g. a bare `S01` season-pack label, or a translated "Season 1 / Episodes 1-2 of 8" summary line), which is not reliable enough to identify an exact season/episode. The underlying per-file filename that TorBox/Torrentio resolves to, however, reliably follows the international `SxxEyy` filename convention (e.g. `Show.Name.S01E01.2160p...mkv`). The script must prefer that per-file filename (or the first line of the stream metadata that actually matches `SxxEyy`) over the noisier top-level release name when identifying season/episode and matching a stream to its series — only falling back to the release name if no `SxxEyy` match is found anywhere. This avoids miscounting season packs as single episodes and avoids treating alternate-language/regional releases of the same episode as distinct entries.
