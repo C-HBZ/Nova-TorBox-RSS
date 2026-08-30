@@ -7,6 +7,7 @@ import unicodedata
 import datetime
 from urllib.parse import quote
 from typing import List, Dict, Set, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 from curl_cffi import requests
 
 # ==========================================
@@ -32,7 +33,19 @@ MANIFEST_URLS = [
 MAX_MOVIES = 30
 MAX_TV_SERIES = 20
 MAX_MEDIA_AGE_MONTHS = 24
-MAX_NEW_EPISODES_PER_SHOW = 15
+MAX_NEW_EPISODES_PER_SHOW = 30
+# TMDB genre ids excluded from all TV discovery paths: News, Soap, Talk. Daily soaps in particular can
+# air 100-200+ episodes per "season" and would otherwise crowd out scripted shows purely on popularity.
+EXCLUDED_TV_GENRE_IDS = {10763, 10766, 10767}
+SERIES_INDEX_PATH = "series_index.json"
+TORRENTIO_CONCURRENCY = 4
+# Calibrated from observed run timing: ~10 movies per 6-10s, ~5 TV shows per ~60s serially (varies with
+# how many episodes each show has aired and how many are already owned and skipped).
+SECONDS_PER_MOVIE_ESTIMATE = 0.8
+SECONDS_PER_TV_SHOW_ESTIMATE = 12.0
+# With TORRENTIO_CONCURRENCY parallel workers, observed wall-clock speedup is ~3x (not the full 4x,
+# due to per-thread request overhead and uneven per-show workloads) - divide the serial estimate by this.
+EFFECTIVE_CONCURRENCY_SPEEDUP = 3.0
 JUSTWATCH_NEW_URL = "https://www.justwatch.com/us/new"
 MIN_TMDB_POPULARITY = 5.0
 MIN_TMDB_VOTE_COUNT = 5
@@ -150,6 +163,9 @@ def is_mainstream_tmdb_candidate(item: dict) -> bool:
         return False
 
     if item.get("adult"):
+        return False
+
+    if EXCLUDED_TV_GENRE_IDS.intersection(item.get("genre_ids") or []):
         return False
 
     popularity = float(item.get("popularity") or 0.0)
@@ -499,12 +515,38 @@ def fetch_torbox_library(session: requests.Session) -> List[dict]:
         return []
 
 
-def get_existing_torbox_items(library: List[dict]) -> Tuple[Set[str], Set[str]]:
+def load_series_index() -> Dict[str, dict]:
+    """Persistent hash -> {series_id, ep_id} map so TV episode identity can rely on the canonical
+    TMDB show id instead of re-parsing a torrent's (often inconsistently spelled) release name."""
+    if os.path.exists(SERIES_INDEX_PATH):
+        try:
+            with open(SERIES_INDEX_PATH, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception as exc:
+            logger.warning(f"Failed to load {SERIES_INDEX_PATH}: {exc}")
+    return {}
+
+
+def save_series_index(index: Dict[str, dict]) -> None:
+    try:
+        with open(SERIES_INDEX_PATH, "w", encoding="utf-8") as handle:
+            json.dump(index, handle)
+    except Exception as exc:
+        logger.warning(f"Failed to save {SERIES_INDEX_PATH}: {exc}")
+
+
+def get_existing_torbox_items(library: List[dict], series_index: Dict[str, dict]) -> Tuple[Set[str], Set[str]]:
     existing_episodes = set()
     existing_movies = set()
 
     for item in library:
         name = item.get("name") or item.get("torrent_name") or ""
+        item_hash = (item.get("hash") or item.get("info_hash") or "").lower()
+        indexed = series_index.get(item_hash) if item_hash else None
+        if indexed and indexed.get("series_id") and indexed.get("ep_id"):
+            existing_episodes.add(f"{indexed['series_id']}_{indexed['ep_id']}")
+            continue
+
         ep_info = extract_episode_info(name)
         if ep_info:
             existing_episodes.add(f"{ep_info[0]}_{ep_info[1]}")
@@ -525,7 +567,7 @@ def delete_torbox_torrent(session: requests.Session, torrent_id) -> bool:
         return False
 
 
-def prune_torbox_library(session: requests.Session, library: List[dict], dry_run: bool,
+def prune_torbox_library(session: requests.Session, library: List[dict], dry_run: bool, series_index: Dict[str, dict],
                           max_movies: int = MAX_MOVIES, max_tv_series: int = MAX_TV_SERIES) -> None:
     """Keep only the newest max_movies movies and max_tv_series distinct TV series (latest season only per series); delete the rest."""
     movie_items: Dict[str, List[dict]] = {}
@@ -596,6 +638,8 @@ def prune_torbox_library(session: requests.Session, library: List[dict], dry_run
             continue
         if delete_torbox_torrent(session, item.get("id")):
             logger.info(f"[PRUNED] Removed old TorBox torrent: {name}")
+            item_hash = (item.get("hash") or item.get("info_hash") or "").lower()
+            series_index.pop(item_hash, None)
         else:
             logger.error(f"Failed to prune TorBox torrent: {name}")
 
@@ -657,6 +701,7 @@ def get_tmdb_recent_media(session: requests.Session, media_type: str, target_cou
             "vote_count.gte": "5",
             "first_air_date.gte": min_date,
             "first_air_date.lte": max_date,
+            "without_genres": ",".join(str(g) for g in EXCLUDED_TV_GENRE_IDS),
         }
 
     while len(results) < target_count and page <= 10:
@@ -722,11 +767,6 @@ def get_latest_season_progress(session: requests.Session, tmdb_id: int) -> Tuple
     return 1, 1, None
 
 
-# TV genre ids excluded from the "currently active" discovery pass (News, Talk) since they are
-# not scripted series and would otherwise dominate a recent-air-date-sorted pool.
-ACTIVE_SERIES_EXCLUDED_GENRE_IDS = (10763, 10767)
-
-
 def get_tmdb_active_tv_series(session: requests.Session, target_count: int = 50) -> List[dict]:
     """Discover currently-active returning TV series by recent episode air date rather than the
     show's original launch date, so long-running shows airing new seasons/episodes are not missed
@@ -745,7 +785,7 @@ def get_tmdb_active_tv_series(session: requests.Session, target_count: int = 50)
         "vote_count.gte": "5",
         "air_date.gte": min_date,
         "air_date.lte": max_date,
-        "without_genres": ",".join(str(g) for g in ACTIVE_SERIES_EXCLUDED_GENRE_IDS),
+        "without_genres": ",".join(str(g) for g in EXCLUDED_TV_GENRE_IDS),
     }
 
     while len(results) < target_count and page <= 10:
@@ -786,6 +826,204 @@ def log_progress(label: str, done: int, total: int, start_time: float) -> None:
     logger.info(f"  ...progress: {done}/{total} {label} evaluated ({elapsed / 60:.1f} min elapsed, ~{remaining / 60:.1f} min remaining)")
 
 
+def process_movie(movie: dict, torrentio_base_url: str, existing_movies: Set[str]) -> Optional[Tuple[dict, List[dict], Dict[str, bool]]]:
+    """Evaluate one movie against Torrentio. Runs in its own thread with its own HTTP session."""
+    title = movie.get("title", "")
+    release_date = movie.get("release_date", "")
+    year = release_date[:4] if release_date else ""
+    tmdb_id = movie.get("id")
+    mov_key = extract_movie_key(f"{title} {year}")
+
+    if not title or not mov_key or not is_recent_enough(release_date):
+        return None
+    if not is_mainstream_tmdb_candidate(movie):
+        return None
+
+    diag = {"title": title, "year": year, "key": mov_key, "status": "PENDING", "streams_found": 0, "reason": ""}
+    local_hints: Dict[str, bool] = {}
+
+    if mov_key in existing_movies:
+        diag["status"] = "SKIPPED"
+        diag["reason"] = "Already exists in TorBox library"
+        return diag, [], local_hints
+
+    session = requests.Session(impersonate="chrome")
+    session.headers.update({"Authorization": f"Bearer {TORBOX_API_KEY}"})
+
+    imdb_id = get_imdb_id(session, tmdb_id, "movie")
+    if not imdb_id:
+        diag["status"] = "REJECTED"
+        diag["reason"] = "No IMDb ID mapped on TMDB"
+        return diag, [], local_hints
+
+    res = safe_http_get(session, f"{torrentio_base_url}/movie/{imdb_id}.json")
+    time.sleep(1.0)
+
+    valid_found: List[dict] = []
+    if res and res.status_code == 200:
+        streams = res.json().get("streams", [])
+        diag["streams_found"] = len(streams)
+        seen_hashes = set()
+        seen_keys = set()
+
+        for stream in streams:
+            t_hash = extract_stream_hash(stream)
+            details = stream.get("title", "")
+            if not details or not t_hash:
+                continue
+            if not is_valid_release(details):
+                continue
+
+            quality = extract_quality_bucket(details)
+            if quality not in ALLOWED_QUALITY_PRIORITY:
+                continue
+
+            dedupe_key = build_torrent_dedupe_key(details, year=year)
+            if t_hash in seen_hashes or dedupe_key in seen_keys:
+                continue
+            seen_hashes.add(t_hash)
+            seen_keys.add(dedupe_key)
+
+            local_hints[t_hash] = local_hints.get(t_hash, False) or is_stream_cached_hint(stream)
+
+            score = calculate_quality_score(details)
+            if score > 0:
+                candidate = {
+                    "key": mov_key,
+                    "hash": t_hash,
+                    "magnet": f"magnet:?xt=urn:btih:{t_hash}&dn={quote(title)}",
+                    "score": score,
+                    "sort_date": release_date or "1970-01-01",
+                    "title": f"{title} ({year}) [{details.splitlines()[0]}]",
+                }
+                valid_found.append(candidate)
+
+        if not valid_found:
+            diag["status"] = "REJECTED"
+            diag["reason"] = "No valid 2160p/1080p English releases found"
+        else:
+            diag["candidates"] = valid_found
+
+    return diag, valid_found, local_hints
+
+
+def process_show(show: dict, torrentio_base_url: str, existing_episodes: Set[str]) -> Optional[Tuple[dict, List[dict], Dict[str, bool]]]:
+    """Evaluate one TV show across its currently-aired episodes. Runs in its own thread with its own HTTP session."""
+    show_title = show.get("name", "")
+    first_air_date = show.get("first_air_date", "")
+
+    if not show_title:
+        return None
+    if not is_mainstream_tmdb_candidate(show):
+        return None
+
+    diag = {"title": show_title, "year": first_air_date[:4] if first_air_date else "", "status": "PENDING", "streams_found": 0, "reason": ""}
+    local_hints: Dict[str, bool] = {}
+
+    session = requests.Session(impersonate="chrome")
+    session.headers.update({"Authorization": f"Bearer {TORBOX_API_KEY}"})
+
+    tmdb_id = show.get("id")
+    imdb_id = get_imdb_id(session, tmdb_id, "tv")
+    if not imdb_id:
+        diag["status"] = "REJECTED"
+        diag["reason"] = "No IMDb ID mapped on TMDB"
+        return diag, [], local_hints
+
+    latest_season, episodes_aired, last_air_date = get_latest_season_progress(session, tmdb_id)
+    # Gate recency on the show's most recent aired episode, not its original launch date, so
+    # long-running/returning series with new activity aren't excluded just for being "old".
+    recency_reference = last_air_date or first_air_date
+    if not is_recent_enough(recency_reference):
+        diag["status"] = "REJECTED"
+        diag["reason"] = "No episodes aired within the last 24 months"
+        return diag, [], local_hints
+
+    # Canonical series identity (TMDB id) instead of text parsed from release names, so the same show
+    # uploaded under different naming conventions (e.g. "Law & Order: SVU" vs "Law and Order Special
+    # Victims Unit") is always treated as one series and doesn't get pushed/tracked twice.
+    series_id = f"tmdb{tmdb_id}"
+    episodes_to_check = min(episodes_aired, MAX_NEW_EPISODES_PER_SHOW)
+
+    valid_found: List[dict] = []
+    got_any_response = False
+
+    for episode_number in range(1, episodes_to_check + 1):
+        guessed_ep_id = f"s{latest_season:02d}e{episode_number:02d}"
+        if f"{series_id}_{guessed_ep_id}" in existing_episodes:
+            continue  # already have this episode; no need to re-query Torrentio for it
+
+        res = safe_http_get(session, f"{torrentio_base_url}/series/{imdb_id}:{latest_season}:{episode_number}.json")
+        time.sleep(1.0)
+        if not (res and res.status_code == 200):
+            continue
+        got_any_response = True
+
+        streams = res.json().get("streams", [])
+        diag["streams_found"] += len(streams)
+        # Reset per episode: a season-pack torrent shares one info-hash across many episodes,
+        # so dedup must not persist across different episode-number queries for this show.
+        seen_hashes = set()
+        seen_keys = set()
+        for stream in streams:
+            details = stream.get("title", "")
+            if not details:
+                continue
+            if not is_valid_release(details):
+                continue
+
+            quality = extract_quality_bucket(details)
+            if quality not in ALLOWED_QUALITY_PRIORITY:
+                continue
+
+            t_hash = extract_stream_hash(stream)
+            if not t_hash:
+                continue
+            episode_text = get_canonical_episode_text(stream)
+            ep_info = extract_episode_info(episode_text)
+            if not ep_info:
+                continue
+            _, ep_id = ep_info
+            if season_number_from_ep_id(ep_id) != latest_season:
+                continue
+            full_ep_key = f"{series_id}_{ep_id}"
+            dedupe_key = build_torrent_dedupe_key(episode_text, episode_key=full_ep_key)
+
+            if t_hash in seen_hashes or dedupe_key in seen_keys:
+                continue
+            seen_hashes.add(t_hash)
+            seen_keys.add(dedupe_key)
+
+            local_hints[t_hash] = local_hints.get(t_hash, False) or is_stream_cached_hint(stream)
+
+            score = calculate_quality_score(details)
+            if score > 0 and full_ep_key not in existing_episodes:
+                candidate = {
+                    "series_key": series_id,
+                    "ep_id": ep_id,
+                    "full_key": full_ep_key,
+                    "hash": t_hash,
+                    "magnet": f"magnet:?xt=urn:btih:{t_hash}&dn={quote(show_title)}",
+                    "score": score,
+                    "sort_date": last_air_date or first_air_date or "1970-01-01",
+                    "title": episode_text.strip() or details.splitlines()[0],
+                }
+                valid_found.append(candidate)
+
+    if not got_any_response:
+        diag["status"] = "REJECTED"
+        diag["reason"] = "No stream response from Torrentio"
+        return diag, [], local_hints
+
+    if not valid_found:
+        diag["status"] = "REJECTED"
+        diag["reason"] = "No new valid 2160p/1080p English episodes found"
+    else:
+        diag["candidates"] = valid_found
+
+    return diag, valid_found, local_hints
+
+
 # ==========================================
 # MAIN AUTOMATION ROUTINE
 # ==========================================
@@ -804,7 +1042,8 @@ def main():
     logger.info(f"Using Torrentio stream base URL: {torrentio_base_url}")
 
     torbox_library = fetch_torbox_library(session)
-    existing_episodes, existing_movies = get_existing_torbox_items(torbox_library)
+    series_index = load_series_index()
+    existing_episodes, existing_movies = get_existing_torbox_items(torbox_library, series_index)
     logger.info(f"Existing TorBox items indexed: {len(existing_movies)} movies, {len(existing_episodes)} episodes.")
 
     recent_movies = get_tmdb_recent_media(session, "movie", target_count=60)
@@ -824,12 +1063,15 @@ def main():
     # just because a flood of brand-new season-1 shows happened to be processed first.
     recent_shows.sort(key=lambda s: (float(s.get("popularity") or 0.0), float(s.get("vote_average") or 0.0)), reverse=True)
 
-    # Rough bound: ~1s per movie call, and 1 to MAX_NEW_EPISODES_PER_SHOW calls per show depending on how
-    # many episodes have aired. Real progress lines below will report actual pace as it runs.
-    est_min_minutes = (len(recent_movies) + len(recent_shows)) / 60
-    est_max_minutes = (len(recent_movies) + len(recent_shows) * MAX_NEW_EPISODES_PER_SHOW) / 60
+    # Estimate using observed per-item pace rather than theoretical worst/best case; divided by the
+    # measured concurrency speedup since Torrentio calls now run across TORRENTIO_CONCURRENCY workers.
+    # A light +/-25% buffer accounts for variance (shows with more/fewer already-owned episodes skip
+    # fewer/more calls).
+    est_seconds = (len(recent_movies) * SECONDS_PER_MOVIE_ESTIMATE + len(recent_shows) * SECONDS_PER_TV_SHOW_ESTIMATE) / EFFECTIVE_CONCURRENCY_SPEEDUP
+    est_min_minutes = (est_seconds * 0.75) / 60
+    est_max_minutes = (est_seconds * 1.25) / 60
     logger.info(f"Found {len(recent_movies)} candidate movies and {len(recent_shows)} candidate TV shows to check against Torrentio.")
-    logger.info(f"Estimated Torrentio querying time: {est_min_minutes:.0f}-{est_max_minutes:.0f} minutes (depends on how many episodes each show has aired).")
+    logger.info(f"Estimated Torrentio querying time: {est_min_minutes:.0f}-{est_max_minutes:.0f} minutes (~{SECONDS_PER_MOVIE_ESTIMATE:.1f}s/movie, ~{SECONDS_PER_TV_SHOW_ESTIMATE:.0f}s/show).")
 
     movie_candidates = []
     movie_diagnostics = []
@@ -837,204 +1079,35 @@ def main():
 
     logger.info("Querying Torrentio for recent films...")
     movie_loop_start = time.time()
-    for movie_index, movie in enumerate(recent_movies, 1):
-        if movie_index % PROGRESS_LOG_EVERY_MOVIES == 0:
-            log_progress("movies", movie_index, len(recent_movies), movie_loop_start)
-        title = movie.get("title", "")
-        release_date = movie.get("release_date", "")
-        year = release_date[:4] if release_date else ""
-        tmdb_id = movie.get("id")
-        mov_key = extract_movie_key(f"{title} {year}")
-
-        if not title or not mov_key or not is_recent_enough(release_date):
-            continue
-        if not is_mainstream_tmdb_candidate(movie):
-            continue
-
-        diag = {"title": title, "year": year, "key": mov_key, "status": "PENDING", "streams_found": 0, "reason": ""}
-
-        if mov_key in existing_movies:
-            diag["status"] = "SKIPPED"
-            diag["reason"] = "Already exists in TorBox library"
+    with ThreadPoolExecutor(max_workers=TORRENTIO_CONCURRENCY) as executor:
+        results = executor.map(lambda m: process_movie(m, torrentio_base_url, existing_movies), recent_movies)
+        for movie_index, result in enumerate(results, 1):
+            if movie_index % PROGRESS_LOG_EVERY_MOVIES == 0:
+                log_progress("movies", movie_index, len(recent_movies), movie_loop_start)
+            if result is None:
+                continue
+            diag, candidates, hints = result
             movie_diagnostics.append(diag)
-            continue
-
-        imdb_id = get_imdb_id(session, tmdb_id, "movie")
-        if not imdb_id:
-            diag["status"] = "REJECTED"
-            diag["reason"] = "No IMDb ID mapped on TMDB"
-            movie_diagnostics.append(diag)
-            continue
-
-        res = safe_http_get(session, f"{torrentio_base_url}/movie/{imdb_id}.json")
-        time.sleep(1.0)
-
-        if res and res.status_code == 200:
-            streams = res.json().get("streams", [])
-            diag["streams_found"] = len(streams)
-            valid_found = []
-            seen_hashes = set()
-            seen_keys = set()
-
-            for stream in streams:
-                t_hash = extract_stream_hash(stream)
-                details = stream.get("title", "")
-                if not details or not t_hash:
-                    continue
-                if not is_valid_release(details):
-                    continue
-
-                quality = extract_quality_bucket(details)
-                if quality not in ALLOWED_QUALITY_PRIORITY:
-                    continue
-
-                dedupe_key = build_torrent_dedupe_key(details, year=year)
-                if t_hash in seen_hashes or dedupe_key in seen_keys:
-                    continue
-                seen_hashes.add(t_hash)
-                seen_keys.add(dedupe_key)
-
-                hash_cache_hints[t_hash] = hash_cache_hints.get(t_hash, False) or is_stream_cached_hint(stream)
-
-                score = calculate_quality_score(details)
-                if score > 0:
-                    candidate = {
-                        "key": mov_key,
-                        "hash": t_hash,
-                        "magnet": f"magnet:?xt=urn:btih:{t_hash}&dn={quote(title)}",
-                        "score": score,
-                        "sort_date": release_date or "1970-01-01",
-                        "title": f"{title} ({year}) [{details.splitlines()[0]}]",
-                    }
-                    movie_candidates.append(candidate)
-                    valid_found.append(candidate)
-
-            if not valid_found:
-                diag["status"] = "REJECTED"
-                diag["reason"] = "No valid 2160p/1080p English releases found"
-            else:
-                diag["candidates"] = valid_found
-            movie_diagnostics.append(diag)
+            movie_candidates.extend(candidates)
+            for h, hint in hints.items():
+                hash_cache_hints[h] = hash_cache_hints.get(h, False) or hint
 
     logger.info("Querying Torrentio for recent series...")
     tv_candidates = []
     tv_diagnostics = []
     tv_loop_start = time.time()
-    for show_index, show in enumerate(recent_shows, 1):
-        if show_index % PROGRESS_LOG_EVERY_SHOWS == 0:
-            log_progress("TV shows", show_index, len(recent_shows), tv_loop_start)
-        show_title = show.get("name", "")
-        first_air_date = show.get("first_air_date", "")
-
-        if not show_title:
-            continue
-        if not is_mainstream_tmdb_candidate(show):
-            continue
-
-        diag = {"title": show_title, "year": first_air_date[:4] if first_air_date else "", "status": "PENDING", "streams_found": 0, "reason": ""}
-
-        tmdb_id = show.get("id")
-        imdb_id = get_imdb_id(session, tmdb_id, "tv")
-        if not imdb_id:
-            diag["status"] = "REJECTED"
-            diag["reason"] = "No IMDb ID mapped on TMDB"
-            tv_diagnostics.append(diag)
-            continue
-
-        latest_season, episodes_aired, last_air_date = get_latest_season_progress(session, tmdb_id)
-        # Gate recency on the show's most recent aired episode, not its original launch date, so
-        # long-running/returning series with new activity aren't excluded just for being "old".
-        recency_reference = last_air_date or first_air_date
-        if not is_recent_enough(recency_reference):
-            diag["status"] = "REJECTED"
-            diag["reason"] = "No episodes aired within the last 24 months"
-            tv_diagnostics.append(diag)
-            continue
-
-        episodes_to_check = min(episodes_aired, MAX_NEW_EPISODES_PER_SHOW)
-
-        valid_found = []
-        known_series_key = None
-        got_any_response = False
-
-        for episode_number in range(1, episodes_to_check + 1):
-            if known_series_key:
-                guessed_ep_id = f"s{latest_season:02d}e{episode_number:02d}"
-                if f"{known_series_key}_{guessed_ep_id}" in existing_episodes:
-                    continue  # already have this episode; no need to re-query Torrentio for it
-
-            res = safe_http_get(session, f"{torrentio_base_url}/series/{imdb_id}:{latest_season}:{episode_number}.json")
-            time.sleep(1.0)
-            if not (res and res.status_code == 200):
+    with ThreadPoolExecutor(max_workers=TORRENTIO_CONCURRENCY) as executor:
+        results = executor.map(lambda s: process_show(s, torrentio_base_url, existing_episodes), recent_shows)
+        for show_index, result in enumerate(results, 1):
+            if show_index % PROGRESS_LOG_EVERY_SHOWS == 0:
+                log_progress("TV shows", show_index, len(recent_shows), tv_loop_start)
+            if result is None:
                 continue
-            got_any_response = True
-
-            streams = res.json().get("streams", [])
-            diag["streams_found"] += len(streams)
-            # Reset per episode: a season-pack torrent shares one info-hash across many episodes,
-            # so dedup must not persist across different episode-number queries for this show.
-            seen_hashes = set()
-            seen_keys = set()
-            for stream in streams:
-                details = stream.get("title", "")
-                if not details:
-                    continue
-                if not is_valid_release(details):
-                    continue
-
-                quality = extract_quality_bucket(details)
-                if quality not in ALLOWED_QUALITY_PRIORITY:
-                    continue
-
-                t_hash = extract_stream_hash(stream)
-                if not t_hash:
-                    continue
-                episode_text = get_canonical_episode_text(stream)
-                ep_info = extract_episode_info(episode_text)
-                if ep_info:
-                    series_key, ep_id = ep_info
-                    if season_number_from_ep_id(ep_id) != latest_season:
-                        continue
-                    known_series_key = known_series_key or series_key
-                    full_ep_key = f"{series_key}_{ep_id}"
-                    dedupe_key = build_torrent_dedupe_key(episode_text, episode_key=full_ep_key)
-                else:
-                    continue
-
-                if t_hash in seen_hashes or dedupe_key in seen_keys:
-                    continue
-                seen_hashes.add(t_hash)
-                seen_keys.add(dedupe_key)
-
-                hash_cache_hints[t_hash] = hash_cache_hints.get(t_hash, False) or is_stream_cached_hint(stream)
-
-                score = calculate_quality_score(details)
-                if score > 0 and full_ep_key not in existing_episodes:
-                    candidate = {
-                        "series_key": series_key,
-                        "ep_id": ep_id,
-                        "full_key": full_ep_key,
-                        "hash": t_hash,
-                        "magnet": f"magnet:?xt=urn:btih:{t_hash}&dn={quote(show_title)}",
-                        "score": score,
-                        "sort_date": last_air_date or first_air_date or "1970-01-01",
-                        "title": episode_text.strip() or details.splitlines()[0],
-                    }
-                    tv_candidates.append(candidate)
-                    valid_found.append(candidate)
-
-        if not got_any_response:
-            diag["status"] = "REJECTED"
-            diag["reason"] = "No stream response from Torrentio"
+            diag, candidates, hints = result
             tv_diagnostics.append(diag)
-            continue
-
-        if not valid_found:
-            diag["status"] = "REJECTED"
-            diag["reason"] = "No new valid 2160p/1080p English episodes found"
-        else:
-            diag["candidates"] = valid_found
-        tv_diagnostics.append(diag)
+            tv_candidates.extend(candidates)
+            for h, hint in hints.items():
+                hash_cache_hints[h] = hash_cache_hints.get(h, False) or hint
 
     all_hashes = list({c["hash"] for c in movie_candidates + tv_candidates})
     logger.info(f"Pinging TorBox cache endpoint for {len(all_hashes)} candidate hashes...")
@@ -1080,12 +1153,13 @@ def main():
 
         selected_series_keys.add(series_key)
         diag["status"] = "SELECTED"
-        diag["selected_count"] = 0
+        show_full_keys = set()
         for c in cached_options:
             full_key = c["full_key"]
             if full_key not in selected_tv or (c["score"], c["sort_date"]) > (selected_tv[full_key]["score"], selected_tv[full_key]["sort_date"]):
                 selected_tv[full_key] = c
-            diag["selected_count"] += 1
+            show_full_keys.add(full_key)
+        diag["selected_count"] = len(show_full_keys)
 
     final_tv_payloads = sorted(selected_tv.values(), key=lambda item: item["sort_date"], reverse=True)
 
@@ -1133,6 +1207,8 @@ def main():
                 res = session.post(f"{TORBOX_BASE_URL}/createtorrent", data={"magnet": item["magnet"]})
                 if res and res.status_code == 200:
                     logger.info(f"[SUCCESS] Added: {item['title']}")
+                    if "ep_id" in item:
+                        series_index[item["hash"]] = {"series_id": item["series_key"], "ep_id": item["ep_id"]}
                 else:
                     logger.error(f"Failed adding {item['title']}")
                 time.sleep(0.5)
@@ -1141,7 +1217,10 @@ def main():
 
     logger.info("==========================================")
     logger.info("Pruning TorBox library to maintain rolling window...")
-    prune_torbox_library(session, torbox_library, dry_run=TEST_RUN)
+    prune_torbox_library(session, torbox_library, dry_run=TEST_RUN, series_index=series_index)
+
+    if not TEST_RUN:
+        save_series_index(series_index)
 
 
 if __name__ == "__main__":
