@@ -55,6 +55,7 @@ Avoid foreign-dub-only releases unless they still contain English audio.
 ## 6. TV Show Requirements
 - Maintain a rolling set of the newest 20 distinct TV series (the cap applies to the count of different shows, not the number of episodes added per run).
 - Only include newly launched or currently active series; avoid older archive content or long‑finished shows.
+- Exclude daily soap operas and other non-scripted long-running formats (TMDB genres: News, Soap, Talk) from all discovery paths, since a single season can span hundreds of episodes and would otherwise crowd out scripted shows on popularity alone.
 - For each tracked series, track only its current/latest season. Do not retain or add episodes from an older season once a newer season exists for that series.
 
 Each refresh cycle must:
@@ -86,6 +87,8 @@ Deduplication must use real metadata:
 - Series identity
 - Torrent hash
 - Release identity
+
+**Series identity must use the canonical TMDB/IMDb id, not parsed release-name text.** Different uploaders spell the same show differently (e.g. "Law & Order: SVU" vs "Law and Order Special Victims Unit"), which would otherwise be treated as two different series and cause the same episode to be queued/pushed twice. The script maintains a persistent local hash-to-series-id index so that once an episode is added, its canonical identity is known directly rather than re-derived from text on every future run.
 
 TorBox must always contain:
 
