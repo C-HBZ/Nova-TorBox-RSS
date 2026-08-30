@@ -6,5 +6,3 @@ https://apps.soluserv.es/stremio_catalog_plus/c.4586dbb3765d08170188cb027e4bfce8
 https://torrentio.strem.fun/sort=qualitysize%7Cqualityfilter=threed,720p,480p,scr,cam,unknown%7Climit=3%7Cdebridoptions=nocatalog%7Ctorbox=${API_TORBOX}/manifest.json
 https://v3-cinemeta.strem.io/manifest.json
 
-Comet json
-{"id":"comet.elfhosted.com","description":"Stremio's fastest torrent/debrid search add-on.","version":"2.0.0","catalogs":[],"resources":[{"name":"stream","types":["movie","series"],"idPrefixes":["tt","kitsu"]}],"types":["movie","series","anime","other"],"logo":"https://raw.githubusercontent.com/g0ldyy/comet/refs/heads/main/comet/assets/icon.png","background":"https://raw.githubusercontent.com/g0ldyy/comet/refs/heads/main/comet/assets/background.png","behaviorHints":{"configurable":true,"configurationRequired":false},"name":"Comet | ElfHosted | TB"}
