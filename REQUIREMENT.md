@@ -1,151 +1,111 @@
-TorBox → Nova Player Automated Content Pipeline Requirements
-1. Goal
+# TorBox → Nova Player Automated Content Pipeline Requirements
+
+## 1. Goal
 Use TorBox via WebDAV as the content source for Nova Player on Android TV, ensuring the Nova library is refreshed multiple times per day with the newest, highest‑quality English‑targeted movies and TV shows aimed at audiences in UK, USA, Australia and Canada.
+
 Foreign-made titles are acceptable when they are English‑language compatible, but the shortlist must prioritise content aimed at English-speaking markets.
 
-2. Source of Truth
+## 2. Source of Truth
 All media discovery and validation must use live Stremio/Torrentio stream JSON payloads as the authoritative source of:
 
-Availability
+- Availability
+- Quality markers
+- Release identity
+- Audio tracks
+- Torrent metadata
 
-Quality markers
+The Comet addon manifest is **NOT** a content source and must never be used for stream discovery.
 
-Release identity
+## 3. Content Scope
+- Focus on recent releases, ideally within the last 24 months.
+- Prioritise new movie releases and newly launched or currently active TV series.
+- Exclude pornography and any clearly inappropriate or non‑family‑safe content.
+- Only include content that is English-language or has English audio/title paths.
 
-Audio tracks
-
-Torrent metadata
-
-The Comet addon manifest is NOT a content source and must never be used for stream discovery.
-
-3. Content Scope
-Focus on recent releases, ideally within the last 24 months.
-
-Prioritise new movie releases and newly launched or currently active TV series.
-
-Exclude pornography and any clearly inappropriate or non‑family‑safe content.
-
-Only include content that is English-language or has English audio/title paths.
-
-4. Quality Rules
+## 4. Quality Rules
 Mandatory priority:
 
-2160p must be selected whenever available.
-
-1080p is allowed only when no valid 2160p release exists.
-
-Reject anything below 1080p.
+- 2160p must be selected whenever available.
+- 1080p is allowed only when no valid 2160p release exists.
+- Reject anything below 1080p.
 
 Reject all low-quality sources:
 
-CAM
-
-Screener
-
-Workprint
-
-Telecine
-
-Telesync
-
-Any obviously junk or pre-release material
+- CAM
+- Screener
+- Workprint
+- Telecine
+- Telesync
+- Any obviously junk or pre-release material
 
 Prefer strong audio tracks:
 
-DTS-HD
-
-TrueHD
-
-Atmos
-
-Dolby Digital
-
-DTS
+- DTS-HD
+- TrueHD
+- Atmos
+- Dolby Digital
+- DTS
 
 Avoid foreign-dub-only releases unless they still contain English audio.
 
-5. Movie Requirements
-Maintain a rolling set of the newest 30 movies that pass all filters.
+## 5. Movie Requirements
+- Maintain a rolling set of the newest 30 movies that pass all filters.
+- The script must discover more than 30 candidates, because some titles will be unavailable or invalid.
+- Select the 30 most recent valid films each run.
+- Update the movie list every refresh cycle.
 
-The script must discover more than 30 candidates, because some titles will be unavailable or invalid.
-
-Select the 30 most recent valid films each run.
-
-Update the movie list every refresh cycle.
-
-6. TV Show Requirements
-Maintain a rolling set of the newest 20 TV series.
-
-Only include newly launched or currently active series.
+## 6. TV Show Requirements
+- Maintain a rolling set of the newest 20 distinct TV series (the cap applies to the count of different shows, not the number of episodes added per run).
+- Only include newly launched or currently active series; avoid older archive content or long‑finished shows.
+- For each tracked series, track only its current/latest season. Do not retain or add episodes from an older season once a newer season exists for that series.
 
 Each refresh cycle must:
 
-Detect new episodes
+- Detect all newly available, cached, valid episodes belonging to the current season of each of the 20 tracked series (not capped per run — a single series may contribute multiple new episodes in one cycle).
+- Add them to the existing series entry.
+- When a series advances to a new season, remove the previous season's episodes from TorBox so only the current season remains for that series.
+- When a series falls out of the newest 20 (superseded by more recently active shows), remove all of its episodes from TorBox.
 
-Add them to the existing series entry
-
-Avoid older archive content or long‑finished shows.
-
-7. Library Management (TorBox)
-TorBox must be accessed via WebDAV for Nova Player compatibility.
-
-The script must ensure Nova Player’s GUI remains correctly populated by maintaining a Nova‑compatible folder structure.
-
-Before queueing any item, the script must check TorBox to avoid:
-
-Re-adding cached items
-
-Duplicates
-
-Redundant downloads
+## 7. Library Management (TorBox)
+- TorBox must be accessed via WebDAV for Nova Player compatibility.
+- The script must ensure Nova Player's GUI remains correctly populated by maintaining a Nova‑compatible folder structure.
+- Before queueing any item, the script must check TorBox to avoid:
+  - Re-adding cached items
+  - Duplicates
+  - Redundant downloads
 
 Deduplication must use real metadata:
 
-IMDb ID
-
-Series identity
-
-Torrent hash
-
-Release identity
+- IMDb ID
+- Series identity
+- Torrent hash
+- Release identity
 
 TorBox must always contain:
 
-20 newest TV series
-
-30 newest movies
+- 20 newest TV series
+- 30 newest movies
 
 Older content must be deleted or replaced automatically.
 
-8. Processing Flow
+## 8. Processing Flow
 The script must follow this exact pipeline:
 
-TMDB discovery
-
-Metadata lookup
-
-Live Stremio/Torrentio stream query
-
-Quality filtering
-
-English‑audience targeting filter
-
-TorBox cache validation
-
-Queue selection
-
-WebDAV sync to Nova Player
+1. TMDB discovery
+2. Metadata lookup
+3. Live Stremio/Torrentio stream query
+4. Quality filtering
+5. English‑audience targeting filter
+6. TorBox cache validation
+7. Queue selection
+8. WebDAV sync to Nova Player
 
 This flow must be used for every refresh cycle, multiple times per day.
 
-9. Operational Notes
-WebDAV is the user-facing storage layer for Nova Player.
-
-The scraper logic must operate entirely from torrent/debrid stream metadata, not filenames.
-
-The system must be capable of continuous updates as new titles become available throughout the day.
-
-
+## 9. Operational Notes
+- WebDAV is the user-facing storage layer for Nova Player.
+- The scraper logic must operate entirely from torrent/debrid stream metadata, not filenames.
+- The system must be capable of continuous updates as new titles become available throughout the day.
 
 ---
 
