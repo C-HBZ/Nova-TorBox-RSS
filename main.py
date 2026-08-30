@@ -72,7 +72,18 @@ PREMIUM_AUDIO_RE = re.compile(r"\b(?:" + "|".join(re.escape(p) for p in PREMIUM_
 STANDARD_AUDIO_RE = re.compile(r"\b(?:" + "|".join(re.escape(p) for p in STANDARD_AUDIO_PATTERNS) + r")\b", re.IGNORECASE)
 NON_LATIN_PATTERN = re.compile(r"[\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+LOG_FILE_PATH = "latest-run.log"
+PROGRESS_LOG_EVERY_MOVIES = 10
+PROGRESS_LOG_EVERY_SHOWS = 5
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE_PATH, mode="w", encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 
@@ -767,6 +778,14 @@ def dedupe_push_items_by_hash(items: List[dict]) -> List[dict]:
     return list(merged.values())
 
 
+def log_progress(label: str, done: int, total: int, start_time: float) -> None:
+    """Periodic heartbeat so a long Torrentio pass doesn't look hung when watched live."""
+    elapsed = time.time() - start_time
+    rate = elapsed / done if done else 0
+    remaining = rate * (total - done)
+    logger.info(f"  ...progress: {done}/{total} {label} evaluated ({elapsed / 60:.1f} min elapsed, ~{remaining / 60:.1f} min remaining)")
+
+
 # ==========================================
 # MAIN AUTOMATION ROUTINE
 # ==========================================
@@ -805,12 +824,22 @@ def main():
     # just because a flood of brand-new season-1 shows happened to be processed first.
     recent_shows.sort(key=lambda s: (float(s.get("popularity") or 0.0), float(s.get("vote_average") or 0.0)), reverse=True)
 
+    # Rough bound: ~1s per movie call, and 1 to MAX_NEW_EPISODES_PER_SHOW calls per show depending on how
+    # many episodes have aired. Real progress lines below will report actual pace as it runs.
+    est_min_minutes = (len(recent_movies) + len(recent_shows)) / 60
+    est_max_minutes = (len(recent_movies) + len(recent_shows) * MAX_NEW_EPISODES_PER_SHOW) / 60
+    logger.info(f"Found {len(recent_movies)} candidate movies and {len(recent_shows)} candidate TV shows to check against Torrentio.")
+    logger.info(f"Estimated Torrentio querying time: {est_min_minutes:.0f}-{est_max_minutes:.0f} minutes (depends on how many episodes each show has aired).")
+
     movie_candidates = []
     movie_diagnostics = []
     hash_cache_hints: Dict[str, bool] = {}
 
     logger.info("Querying Torrentio for recent films...")
-    for movie in recent_movies:
+    movie_loop_start = time.time()
+    for movie_index, movie in enumerate(recent_movies, 1):
+        if movie_index % PROGRESS_LOG_EVERY_MOVIES == 0:
+            log_progress("movies", movie_index, len(recent_movies), movie_loop_start)
         title = movie.get("title", "")
         release_date = movie.get("release_date", "")
         year = release_date[:4] if release_date else ""
@@ -890,7 +919,10 @@ def main():
     logger.info("Querying Torrentio for recent series...")
     tv_candidates = []
     tv_diagnostics = []
-    for show in recent_shows:
+    tv_loop_start = time.time()
+    for show_index, show in enumerate(recent_shows, 1):
+        if show_index % PROGRESS_LOG_EVERY_SHOWS == 0:
+            log_progress("TV shows", show_index, len(recent_shows), tv_loop_start)
         show_title = show.get("name", "")
         first_air_date = show.get("first_air_date", "")
 
