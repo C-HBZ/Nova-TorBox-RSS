@@ -14,8 +14,6 @@ All media discovery and validation must use live Stremio/Torrentio stream JSON p
 - Audio tracks
 - Torrent metadata
 
-The Comet addon manifest is **NOT** a content source and must never be used for stream discovery.
-
 ## 3. Content Scope
 - Focus on recent releases, ideally within the last 24 months.
 - Prioritise new movie releases and newly launched or currently active TV series.
@@ -137,8 +135,8 @@ This flow must be used for every refresh cycle, multiple times per day.
 - Validate manifest JSON against an expected schema; fail fast and alert on schema changes.
 
 **Stream JSON schema**
-- Expect and parse: `quality`, `resolution`, `size`, `audio`, `audioCodec`, `audioLanguages`, `hash`, `torrentId`, `releaseName`, `releaseGroup`, `seeders`, `leechers`, `provider`, `language`, `subtitleLanguages`, `magnet`/`torrentUrl`.
-- Fail selection if required fields are missing.
+- Confirmed live shape (Torrentio, debrid-integrated manifest): each stream object has `name` (short quality/source label, prefixed `[TB+]` when already cached on TorBox or `[TB download]` when not), a multi-line `title` (release name + per-file filename + seeders/size/tracker/language info), a `url` (a `/resolve/torbox/<key>/<hash>/...` link — the torrent hash is embedded in this path, there is no separate `infoHash` field), and `behaviorHints.filename`/`behaviorHints.bingeGroup`. There is no separate structured `audioCodec`, `seeders`, `provider`, or `subtitleLanguages` field — that information is embedded as free text inside `title` and must be parsed from it.
+- Fail selection if a stream has no valid hash (from `infoHash` or parsed from the `url`) and no parsable release title.
 
 **Retention and pruning**
 - TorBox must retain exactly **20 TV series** and **30 movies**; deletion decisions must use canonical IDs and torrent hashes.
