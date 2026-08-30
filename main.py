@@ -681,12 +681,14 @@ def get_imdb_id(session: requests.Session, tmdb_id: int, media_type: str) -> Opt
     return None
 
 
-def get_latest_season_progress(session: requests.Session, tmdb_id: int) -> Tuple[int, int]:
-    """Return (season_number, episodes_aired_so_far) for the show's current/most recent season.
+def get_latest_season_progress(session: requests.Session, tmdb_id: int) -> Tuple[int, int, Optional[str]]:
+    """Return (season_number, episodes_aired_so_far, last_air_date) for the show's current/most recent season.
 
     Mirrors how Stremio/Torrentio-style clients track episode progress: TMDB's last_episode_to_air
     tells us both the active season and how many episodes of it have actually aired, so we know the
-    full range of episodes worth searching for instead of only ever asking for episode 1.
+    full range of episodes worth searching for instead of only ever asking for episode 1. The air
+    date is used to judge whether the show is still recently active, since a long-running show's
+    original first_air_date can be years old even while it airs brand new episodes today.
     """
     res = safe_http_get(session, f"{TMDB_BASE_URL}/tv/{tmdb_id}", params={"api_key": TMDB_API_KEY})
     if res and res.status_code == 200:
@@ -694,18 +696,75 @@ def get_latest_season_progress(session: requests.Session, tmdb_id: int) -> Tuple
         last_ep = data.get("last_episode_to_air") or {}
         season_number = last_ep.get("season_number")
         episode_number = last_ep.get("episode_number")
+        last_air_date = last_ep.get("air_date") or data.get("last_air_date")
         if isinstance(season_number, int) and season_number > 0 and isinstance(episode_number, int) and episode_number > 0:
-            return season_number, episode_number
+            return season_number, episode_number, last_air_date
 
         next_ep = data.get("next_episode_to_air") or {}
         season_number = next_ep.get("season_number")
         if isinstance(season_number, int) and season_number > 0:
-            return season_number, 1
+            return season_number, 1, next_ep.get("air_date") or last_air_date
 
         number_of_seasons = data.get("number_of_seasons")
         if isinstance(number_of_seasons, int) and number_of_seasons > 0:
-            return number_of_seasons, 1
-    return 1, 1
+            return number_of_seasons, 1, last_air_date
+    return 1, 1, None
+
+
+# TV genre ids excluded from the "currently active" discovery pass (News, Talk) since they are
+# not scripted series and would otherwise dominate a recent-air-date-sorted pool.
+ACTIVE_SERIES_EXCLUDED_GENRE_IDS = (10763, 10767)
+
+
+def get_tmdb_active_tv_series(session: requests.Session, target_count: int = 50) -> List[dict]:
+    """Discover currently-active returning TV series by recent episode air date rather than the
+    show's original launch date, so long-running shows airing new seasons/episodes are not missed
+    by a "newly launched" discovery pass alone."""
+    results: List[dict] = []
+    page = 1
+    today = datetime.date.today()
+    min_date = (today - datetime.timedelta(days=730)).isoformat()
+    max_date = today.isoformat()
+    endpoint = f"{TMDB_BASE_URL}/discover/tv"
+    params_template = {
+        "api_key": TMDB_API_KEY,
+        "sort_by": "popularity.desc",
+        "include_adult": "false",
+        "language": "en-US",
+        "vote_count.gte": "5",
+        "air_date.gte": min_date,
+        "air_date.lte": max_date,
+        "without_genres": ",".join(str(g) for g in ACTIVE_SERIES_EXCLUDED_GENRE_IDS),
+    }
+
+    while len(results) < target_count and page <= 10:
+        params = {**params_template, "page": page}
+        res = safe_http_get(session, endpoint, params=params)
+        if not res:
+            break
+        data = res.json()
+        page_results = data.get("results", [])
+        if not page_results:
+            break
+        for item in page_results:
+            if is_mainstream_tmdb_candidate(item):
+                results.append(item)
+        page += 1
+
+    return results[:target_count]
+
+
+def dedupe_push_items_by_hash(items: List[dict]) -> List[dict]:
+    """Collapse candidates sharing the same torrent hash (e.g. multiple episodes resolved from one
+    season-pack file) into a single push entry, so the same magnet isn't submitted to TorBox repeatedly."""
+    merged: Dict[str, dict] = {}
+    for item in items:
+        h = item["hash"]
+        if h not in merged:
+            merged[h] = {**item, "titles": [item["title"]]}
+        else:
+            merged[h]["titles"].append(item["title"])
+    return list(merged.values())
 
 
 # ==========================================
@@ -731,8 +790,20 @@ def main():
 
     recent_movies = get_tmdb_recent_media(session, "movie", target_count=60)
     recent_shows = get_tmdb_recent_media(session, "tv", target_count=60)
+
+    active_shows = get_tmdb_active_tv_series(session, target_count=60)
+    known_show_ids = {s.get("id") for s in recent_shows}
+    added_active = [s for s in active_shows if s.get("id") not in known_show_ids]
+    recent_shows += added_active
+    logger.info(f"Currently-active TV discovery added {len(added_active)} returning series not found by the newly-launched pass.")
+
     recent_movies, recent_shows = merge_justwatch_new_titles(session, recent_movies, recent_shows)
     logger.info(f"TMDB + JustWatch new results: {len(recent_movies)} movies and {len(recent_shows)} series after merge.")
+
+    # Evaluate shows by genuine popularity/rating (from the TMDB metadata we already fetched) rather than
+    # by discovery-pass order, so a well-regarded returning series isn't starved out of the 20 series slots
+    # just because a flood of brand-new season-1 shows happened to be processed first.
+    recent_shows.sort(key=lambda s: (float(s.get("popularity") or 0.0), float(s.get("vote_average") or 0.0)), reverse=True)
 
     movie_candidates = []
     movie_diagnostics = []
@@ -823,7 +894,7 @@ def main():
         show_title = show.get("name", "")
         first_air_date = show.get("first_air_date", "")
 
-        if not show_title or not is_recent_enough(first_air_date):
+        if not show_title:
             continue
         if not is_mainstream_tmdb_candidate(show):
             continue
@@ -838,12 +909,19 @@ def main():
             tv_diagnostics.append(diag)
             continue
 
-        latest_season, episodes_aired = get_latest_season_progress(session, tmdb_id)
+        latest_season, episodes_aired, last_air_date = get_latest_season_progress(session, tmdb_id)
+        # Gate recency on the show's most recent aired episode, not its original launch date, so
+        # long-running/returning series with new activity aren't excluded just for being "old".
+        recency_reference = last_air_date or first_air_date
+        if not is_recent_enough(recency_reference):
+            diag["status"] = "REJECTED"
+            diag["reason"] = "No episodes aired within the last 24 months"
+            tv_diagnostics.append(diag)
+            continue
+
         episodes_to_check = min(episodes_aired, MAX_NEW_EPISODES_PER_SHOW)
 
         valid_found = []
-        seen_hashes = set()
-        seen_keys = set()
         known_series_key = None
         got_any_response = False
 
@@ -861,6 +939,10 @@ def main():
 
             streams = res.json().get("streams", [])
             diag["streams_found"] += len(streams)
+            # Reset per episode: a season-pack torrent shares one info-hash across many episodes,
+            # so dedup must not persist across different episode-number queries for this show.
+            seen_hashes = set()
+            seen_keys = set()
             for stream in streams:
                 details = stream.get("title", "")
                 if not details:
@@ -903,7 +985,7 @@ def main():
                         "hash": t_hash,
                         "magnet": f"magnet:?xt=urn:btih:{t_hash}&dn={quote(show_title)}",
                         "score": score,
-                        "sort_date": first_air_date or "1970-01-01",
+                        "sort_date": last_air_date or first_air_date or "1970-01-01",
                         "title": episode_text.strip() or details.splitlines()[0],
                     }
                     tv_candidates.append(candidate)
@@ -1002,15 +1084,19 @@ def main():
     logger.info(f"SELECTION SUMMARY: {len(final_movies)} Movies, {len(selected_series_keys)} TV Series ({len(final_tv_payloads)} new episodes) queued.")
     logger.info("==========================================")
 
+    pushable_movies = dedupe_push_items_by_hash(final_movies)
+    pushable_tv = dedupe_push_items_by_hash(final_tv_payloads)
+
     if TEST_RUN:
         logger.info("[TEST RUN ACTIVE] Items identified but NOT pushed to TorBox:\n")
-        for m in final_movies:
+        for m in pushable_movies:
             logger.info(f"  - FILM: {m['title']} (Hash: {m['hash']})")
-        for t in final_tv_payloads:
-            logger.info(f"  - TV:   {t['title']} (Hash: {t['hash']})")
+        for t in pushable_tv:
+            title = t["titles"][0] if len(t["titles"]) == 1 else f"{t['titles'][0]} (+{len(t['titles']) - 1} more episode(s) in this file)"
+            logger.info(f"  - TV:   {title} (Hash: {t['hash']})")
     else:
         logger.info("[LIVE RUN ACTIVE] Pushing cached magnets to TorBox...")
-        for item in final_movies + final_tv_payloads:
+        for item in pushable_movies + pushable_tv:
             try:
                 res = session.post(f"{TORBOX_BASE_URL}/createtorrent", data={"magnet": item["magnet"]})
                 if res and res.status_code == 200:
